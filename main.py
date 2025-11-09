@@ -1,6 +1,7 @@
 import os
 import psycopg2
 import finnhub
+import time
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,9 +77,7 @@ def get_db_connection():
         print(f"Error connecting to database: {e}")
         raise HTTPException(status_code=500, detail="Database connection error")
 
-#
-# --- THIS IS THE NEW HELPER FUNCTION ---
-#
+# --- Finnhub Symbol Helper ---
 def get_finnhub_symbol(symbol, type):
     """Helper to format symbol for Finnhub crypto"""
     if type == 'crypto':
@@ -99,9 +98,6 @@ def get_finnhub_symbol(symbol, type):
 def read_root():
     return {"status": f"Sentiment API at {os.getenv('RENDER_EXTERNAL_URL', 'local')} is running"}
 
-#
-# --- THIS IS THE CORRECTED LIVE PRICE FUNCTION ---
-#
 @app.get("/api/v1/live-price")
 def get_live_price(symbol: str = Query(..., min_length=1)):
     """
@@ -131,8 +127,6 @@ def get_live_price(symbol: str = Query(..., min_length=1)):
         quote = finnhub_client.quote(finnhub_symbol)
         
         if quote['c'] == 0 and quote['dp'] == 0:
-            # Finnhub might return 0 for valid symbols with no recent trade.
-            # We'll check crypto price differently if quote fails.
             if symbol_type == 'crypto':
                  # Fallback for crypto: use candle
                 to_ts = int(time.time())
@@ -334,7 +328,7 @@ def search_symbols(query: str = Query(..., min_length=1)):
         conn.close()
         return {"data": results}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error searching: {e}")
+        raise HTTPException(status_code=5.00, detail=f"Error searching: {e}")
 
 #
 # --- Private Task Endpoints (for Cron-Job.org & Admin) ---
@@ -358,7 +352,7 @@ async def trigger_news_ingest(background_tasks: BackgroundTasks):
     return {"message": "News ingest task started in the background."}
 
 @app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
-async def trigger_trends_ ingest(background_tasks: BackgroundTasks):
+async def trigger_trends_ingest(background_tasks: BackgroundTasks): # <-- THE FIX IS HERE
     """
     Secure endpoint to trigger the Google Trends ingest task (for cron).
     """
