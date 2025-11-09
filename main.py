@@ -250,11 +250,16 @@ def get_chart_data(
         print(f"Error fetching chart data for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching chart data: {e}")
 
+#
+# --- THIS IS THE FIX ---
+# We are removing the 'url' column from the SELECT statement.
+# This prevents the 500 Internal Server Error if the column doesn't exist yet.
+#
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
     # Fetches 10 most recent POSITIVE news articles
     sql = """
-    SELECT headline, source_name, time, url
+    SELECT headline, source_name, time
     FROM news_articles
     WHERE symbol = %s AND sentiment_score > 0.3
     ORDER BY time DESC
@@ -273,11 +278,15 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
 
+#
+# --- THIS IS THE FIX ---
+# We are removing the 'url' column from the SELECT statement.
+#
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
     # Fetches 10 most recent NEGATIVE news articles
     sql = """
-    SELECT headline, source_name, time, url
+    SELECT headline, source_name, time
     FROM news_articles
     WHERE symbol = %s AND sentiment_score < -0.3
     ORDER BY time DESC
@@ -328,7 +337,7 @@ def search_symbols(query: str = Query(..., min_length=1)):
         conn.close()
         return {"data": results}
     except Exception as e:
-        raise HTTPException(status_code=5.00, detail=f"Error searching: {e}")
+        raise HTTPException(status_code=500, detail=f"Error searching: {e}")
 
 #
 # --- Private Task Endpoints (for Cron-Job.org & Admin) ---
@@ -352,7 +361,7 @@ async def trigger_news_ingest(background_tasks: BackgroundTasks):
     return {"message": "News ingest task started in the background."}
 
 @app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
-async def trigger_trends_ingest(background_tasks: BackgroundTasks): # <-- THE FIX IS HERE
+async def trigger_trends_ingest(background_tasks: BackgroundTasks):
     """
     Secure endpoint to trigger the Google Trends ingest task (for cron).
     """
