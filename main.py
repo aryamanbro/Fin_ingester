@@ -129,7 +129,7 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. THIS IS THE FULLY CORRECTED QUERY
+    # 3. THIS IS THE SIMPLIFIED QUERY (NO LOCF)
     sql_query = f"""
     WITH time_series AS (
       -- Generate a complete series of timestamps (hourly or daily)
@@ -160,9 +160,6 @@ def get_chart_data(
       GROUP BY bucket
     ),
     price_data AS (
-      -- ********** THIS IS THE FIX **********
-      -- We now bucket prices by the DYNAMIC {bucket_size} (e.g., '1 hour')
-      -- This will use the hourly data you ingested.
       SELECT
         time_bucket('{bucket_size}', time) AS bucket,
         last(price, time) as "close"
@@ -170,39 +167,20 @@ def get_chart_data(
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY bucket
-    ),
-    joined_data AS (
-      SELECT
-        t.bucket,
-        p.close,
-        g.google_score,
-        s.avg_sentiment
-      FROM time_series AS t
-      -- Join price data on the correct {bucket_size}
-      LEFT JOIN price_data AS p ON t.bucket = p.bucket
-      -- Join trends data by bucketing the time_series to a day
-      LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
-      -- Join sentiment data on the correct {bucket_size}
-      LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
-      WHERE t.bucket > (NOW() - INTERVAL '{time_interval}')
-    ),
-    -- Create the "fill groups" for performing LOCF (Last Observation Carried Forward)
-    grouped_data AS (
-      SELECT
-        *,
-        count(close) OVER (ORDER BY bucket) as price_fill_group,
-        count(google_score) OVER (ORDER BY bucket) as trend_fill_group,
-        count(avg_sentiment) OVER (ORDER BY bucket) as sentiment_fill_group
-      FROM joined_data
     )
-    -- Final select to perform the "fill"
+    -- Final SELECT. We've removed the LOCF logic.
+    -- This will naturally have NULL values where no data exists for a bucket.
     SELECT
-      bucket AS "time",
-      first_value(close) OVER (PARTITION BY price_fill_group ORDER BY bucket) AS "close",
-      first_value(google_score) OVER (PARTITION BY trend_fill_group ORDER BY bucket) AS "google_score",
-      first_value(avg_sentiment) OVER (PARTITION BY sentiment_fill_group ORDER BY bucket) AS "avg_sentiment"
-    FROM grouped_data
-    ORDER BY bucket ASC;
+      t.bucket AS "time",
+      p.close,
+      g.google_score,
+      s.avg_sentiment
+    FROM time_series AS t
+    LEFT JOIN price_data AS p ON t.bucket = p.bucket
+    LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
+    LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
+    WHERE t.bucket > (NOW() - INTERVAL '{time_interval}')
+    ORDER BY t.bucket ASC;
     """
     
     chart_data = []
