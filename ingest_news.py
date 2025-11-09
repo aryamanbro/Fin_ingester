@@ -9,7 +9,7 @@ import time
 load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-FINNHUB_KEY = os.getenv('FINNHUB_API_KEY') # Use the same key
+FINNHUB_KEY = os.getenv('FINNHUB_API_KEY')
 HF_TOKEN = os.getenv('HF_TOKEN')
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 FINBERT_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
@@ -54,16 +54,16 @@ def fetch_news_data():
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
-        # --- This is a failsafe. If the 'url' column doesn't exist, add it. ---
-        # This makes the fix idempotent.
+        # --- FIX 1: Add 'url' and 'finnhub_id' columns if they don't exist ---
         try:
             cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
+            cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT UNIQUE;")
             conn.commit()
-            print("News Ingest Task: Ensured 'url' column exists.")
+            print("News Ingest Task: Ensured 'url' and 'finnhub_id' columns exist.")
         except Exception as alter_e:
-            print(f"Warning: Could not add 'url' column (it might exist): {alter_e}")
-            conn.rollback() # Rollback the ALTER TABLE, but continue the script
-        # ----------------------------------------------------------------------
+            print(f"Warning: Could not alter table (may be a permissions issue): {alter_e}")
+            conn.rollback()
+        # --------------------------------------------------------------------
             
         print("News Ingest Task: Fetching symbols to track from database...")
         cur.execute("SELECT symbol, type FROM tracked_symbols")
@@ -75,13 +75,14 @@ def fetch_news_data():
 
         print(f"News Ingest Task: Tracking {len(symbols_to_track)} symbols.")
         
-        # Get news from 1 day ago
         to_date = datetime.now().strftime('%Y-%m-%d')
         from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         
         total_sentiment = 0
         articles_analyzed = 0
         
+        all_articles_to_process = {} # Use a dict to avoid duplicate processing
+
         for symbol, type in symbols_to_track:
             print(f"News Ingest Task: Fetching news for {symbol}...")
             articles = []
@@ -98,50 +99,55 @@ def fetch_news_data():
                 if not articles:
                     print(f"News Ingest Task: No new articles found for {symbol}.")
                     continue
-
-                print(f"News Ingest Task: Found {len(articles)} articles for {symbol}. Analyzing...")
-
-                for article in articles:
-                    headline = article['headline']
-                    article_url = article['url'] # Get the URL
-                    
-                    if not headline:
-                        continue
-                    
-                    # Check if headline already exists to avoid re-analyzing
-                    cur.execute("SELECT 1 FROM news_articles WHERE headline = %s AND symbol = %s", (headline, symbol))
-                    if cur.fetchone():
-                        continue # Skip if already processed
-
-                    sentiment_score = get_finbert_sentiment(headline)
-                    article_time = datetime.fromtimestamp(article['datetime'])
-                    
-                    # --- THIS IS THE FIX ---
-                    # Added 'url' to the query
-                    insert_query = """
-                    INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (time, headline) DO NOTHING;
-                    """
-                    # Added 'article_url' to the parameters
-                    cur.execute(insert_query, (
-                        article_time,
-                        symbol,
-                        headline,
-                        article['source'],
-                        sentiment_score,
-                        article_url 
-                    ))
-                    
-                    total_sentiment += sentiment_score
-                    articles_analyzed += 1
                 
-                conn.commit()
+                # Add articles to our processing dict, keyed by Finnhub ID
+                # This automatically handles duplicates
+                for article in articles:
+                    if article['id'] not in all_articles_to_process:
+                        all_articles_to_process[article['id']] = (article, symbol)
 
             except Exception as e:
-                print(f"Error processing news for {symbol}: {e}")
+                print(f"Error fetching news for {symbol}: {e}")
+
+        
+        print(f"News Ingest Task: Found {len(all_articles_to_process)} unique articles. Analyzing...")
+        
+        for finnhub_id, (article, symbol) in all_articles_to_process.items():
+            try:
+                headline = article['headline']
+                article_url = article['url']
+                article_time = datetime.fromtimestamp(article['datetime'])
+
+                if not headline:
+                    continue
+
+                sentiment_score = get_finbert_sentiment(headline)
+                
+                # --- FIX 2: Insert with 'finnhub_id' and 'url' ---
+                insert_query = """
+                INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (finnhub_id) DO NOTHING;
+                """
+                cur.execute(insert_query, (
+                    article_time,
+                    symbol,
+                    headline,
+                    article['source'],
+                    sentiment_score,
+                    article_url,
+                    finnhub_id
+                ))
+                
+                if cur.rowcount > 0: # Only count if it was a new article
+                    articles_analyzed += 1
+                    total_sentiment += sentiment_score
+            
+            except Exception as insert_e:
+                print(f"Error inserting article {finnhub_id}: {insert_e}")
                 conn.rollback()
 
+        conn.commit()
         print(f"News Ingest Task: Successfully inserted {articles_analyzed} new articles.")
 
         if articles_analyzed > 0:
