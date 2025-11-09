@@ -181,7 +181,7 @@ def get_chart_data(symbol: str = Query(..., min_length=1), timeframe: str = Quer
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(sql_query, (symbol, symbol, symbol))
+    cur.execute(sql_query, (symbol, symbol))
     rows = cur.fetchall()
     colnames = [desc[0] for desc in cur.description]
     cur.close()
