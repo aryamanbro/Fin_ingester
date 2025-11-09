@@ -21,6 +21,7 @@ load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL')
 FINNHUB_KEY = os.getenv('FINNHUB_API_KEY')
 TASK_SECRET_KEY = os.getenv('TASK_SECRET_KEY') # Your new secret key for cron jobs
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 
 # Check for essential keys
 if not TASK_SECRET_KEY:
@@ -46,6 +47,12 @@ app.add_middleware(
 )
 
 # --- Security Helper ---
+async def verify_admin_password(x_admin_password: str = Header(None)):
+    """Verifies the admin password for manual admin endpoints."""
+    if x_admin_password != ADMIN_PASSWORD:
+        print(f"Failed admin auth: Invalid password received.")
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Admin Password")
+        
 async def verify_secret(x_task_secret: str = Header(None)):
     """Verifies the secret key for cron job tasks."""
     if x_task_secret != TASK_SECRET_KEY:
