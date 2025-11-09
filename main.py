@@ -129,38 +129,34 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. THIS IS THE CORRECTED QUERY
-    # We replace `LOCF(...)` with `last_value(...) IGNORE NULLS OVER (...)`
+    # 3. THIS IS THE CORRECTED, HIGHLY-COMPATIBLE QUERY
     sql_query = f"""
     WITH daily_sentiment AS (
       SELECT 
         time_bucket('{bucket_size}', time) AS bucket,
-        symbol,
         avg(sentiment_score) AS avg_sentiment
       FROM news_articles
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket, symbol
+      GROUP BY bucket
     ),
     google_trends_daily AS (
       SELECT 
         time_bucket('1 day', time) AS bucket, 
-        symbol,
         avg(score) AS google_score
       FROM google_trends
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket, symbol
+      GROUP BY bucket
     ),
     prices_daily AS (
       SELECT
         time_bucket('1 day', time) AS bucket,
-        symbol,
         last(price, time) as "close"
       FROM prices
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket, symbol
+      GROUP BY bucket
     ),
     time_series AS (
       SELECT time_bucket('{bucket_size}', g.time) AS bucket
@@ -170,37 +166,43 @@ def get_chart_data(
         INTERVAL '{bucket_size}'
       ) AS g(time)
       GROUP BY bucket
+    ),
+    -- New intermediate step to join data
+    joined_data AS (
+      SELECT
+        t.bucket,
+        p.close,
+        g.google_score,
+        d.avg_sentiment
+      FROM time_series AS t
+      -- Join daily data (prices) on a daily-bucketed version of the time_series
+      LEFT JOIN prices_daily AS p ON time_bucket('1 day', t.bucket) = p.bucket
+      -- Join daily data (trends) on a daily-bucketed version of the time_series
+      LEFT JOIN google_trends_daily AS g ON time_bucket('1 day', t.bucket) = g.bucket
+      -- Join sentiment (which is already hourly/daily) directly
+      LEFT JOIN daily_sentiment AS d ON t.bucket = d.bucket
+      WHERE t.bucket > (NOW() - INTERVAL '{time_interval}')
+    ),
+    -- New step to create the "fill" groups for LOCF
+    grouped_data AS (
+      SELECT
+        *,
+        -- Create a group ID that increments every time there's a new non-null price
+        count(close) OVER (ORDER BY bucket) as price_fill_group,
+        -- Create a group ID for trends
+        count(google_score) OVER (ORDER BY bucket) as trend_fill_group
+      FROM joined_data
     )
-    
+    -- Final select to perform the "fill"
     SELECT
-      t.bucket AS "time",
-      
-      -- CORRECTED "Last Observation Carried Forward"
-      last_value(p.close) IGNORE NULLS OVER (
-          PARTITION BY p.symbol 
-          ORDER BY t.bucket 
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-      ) AS "close",
-      
-      last_value(g.google_score) IGNORE NULLS OVER (
-          PARTITION BY g.symbol 
-          ORDER BY t.bucket 
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-      ) AS "google_score",
-      
-      d.avg_sentiment
-    
-    FROM time_series AS t
-    LEFT JOIN prices_daily AS p 
-      ON time_bucket('1 day', t.bucket) = p.bucket AND p.symbol = %s
-    LEFT JOIN google_trends_daily AS g 
-      ON time_bucket('1 day', t.bucket) = g.bucket AND g.symbol = %s
-    LEFT JOIN daily_sentiment AS d 
-      ON t.bucket = d.bucket AND d.symbol = %s
-      
-    WHERE 
-      t.bucket > (NOW() - INTERVAL '{time_interval}')
-    ORDER BY t.bucket ASC;
+      bucket AS "time",
+      -- Get the first price value from its fill group
+      first_value(close) OVER (PARTITION BY price_fill_group ORDER BY bucket) AS "close",
+      -- Get the first trend value from its fill group
+      first_value(google_score) OVER (PARTITION BY trend_fill_group ORDER BY bucket) AS "google_score",
+      avg_sentiment
+    FROM grouped_data
+    ORDER BY bucket ASC;
     """
     
     chart_data = []
@@ -208,8 +210,8 @@ def get_chart_data(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Pass the symbol 6 times, once for each WHERE/JOIN
-        cur.execute(sql_query, (symbol, symbol, symbol, symbol, symbol, symbol))
+        # 4. Pass the symbol 3 times (for the 3 CTEs)
+        cur.execute(sql_query, (symbol, symbol, symbol))
         
         rows = cur.fetchall()
         
