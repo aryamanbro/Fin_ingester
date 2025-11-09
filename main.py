@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 # ---
 # IMPORT YOUR INGESTOR SCRIPTS AS FUNCTIONS
 # This assumes ingest_prices.py has a function fetch_price_data()
@@ -20,44 +21,53 @@ load_dotenv()
 # --- Configuration ---
 DATABASE_URL = os.getenv('DATABASE_URL')
 FINNHUB_KEY = os.getenv('FINNHUB_API_KEY')
-TASK_SECRET_KEY = os.getenv('TASK_SECRET_KEY') # Your new secret key for cron jobs
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+TASK_SECRET_KEY = os.getenv('TASK_SECRET_KEY') # For cron jobs
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')   # For manual admin actions
 
 # Check for essential keys
-if not TASK_SECRET_KEY:
-    print("Error: TASK_SECRET_KEY not found in .env file.")
+if not TASK_SECRET_KEY or not ADMIN_PASSWORD:
+    print("Error: TASK_SECRET_KEY or ADMIN_PASSWORD not found in .env file.")
     # In a real app, you might exit here
     # exit(1)
-class NewSymbol(BaseModel):
-    symbol: str
-    type: str
+
 # --- App Setup ---
 app = FastAPI()
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
+# --- Pydantic Model ---
+class NewSymbol(BaseModel):
+    symbol: str
+    type: str  # e.g., 'stock' or 'crypto'
+
+
 # --- CORS Middleware ---
-# This allows your Vercel React app to call this API
+# TODO: In production, change "*" to your Vercel app's URL
+allow_origins = [
+    "http://127.0.0.1:8080",  # Local dev
+    "http://localhost:8080",   # Local dev
+    "*"                      # Placeholder for your production URL
+]
+
 app.add_middleware(
     CORSMiddleware,
-    # In production, change "*" to your Vercel app's URL
-    allow_origins=["*"], 
+    allow_origins=allow_origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Security Helper ---
+# --- Security Helpers ---
+async def verify_secret(x_task_secret: str = Header(None)):
+    """Verifies the secret key for automated cron job tasks."""
+    if x_task_secret != TASK_SECRET_KEY:
+        print(f"Failed task auth: Invalid key received.")
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Task Secret Key")
+
 async def verify_admin_password(x_admin_password: str = Header(None)):
     """Verifies the admin password for manual admin endpoints."""
     if x_admin_password != ADMIN_PASSWORD:
         print(f"Failed admin auth: Invalid password received.")
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid Admin Password")
-        
-async def verify_secret(x_task_secret: str = Header(None)):
-    """Verifies the secret key for cron job tasks."""
-    if x_task_secret != TASK_SECRET_KEY:
-        print(f"Failed task auth: Invalid key received.")
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Task Secret Key")
 
 # --- Database Helper ---
 def get_db_connection():
@@ -103,6 +113,11 @@ def get_chart_data(
     """
     Fetches all historical data (prices, sentiment, trends)
     for the main dashboard chart, with a dynamic timeframe.
+    
+    This query is designed to handle mixed granularities:
+    - Prices are daily (filled forward for hourly views).
+    - Sentiment can be hourly.
+    - Trends are daily (filled forward for hourly views).
     """
 
     # 1. Convert timeframe to a SQL INTERVAL
@@ -117,59 +132,85 @@ def get_chart_data(
         time_interval = "10 years" # "All"
 
     # 2. Determine the bucket size for grouping
-    # For 1W/1M, we bucket by hour. For 1Y/ALL, we bucket by day.
     bucket_size = "1 day"
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # This is the "Ultimate" query, now with dynamic timeframe and bucketing
+    # 3. This is the new, fixed query
+    # This assumes TimescaleDB is installed for time_bucket, LOCF, and generate_series.
     sql_query = f"""
     WITH daily_sentiment AS (
       SELECT 
-        time_bucket('{bucket_size}', time) AS day,
+        time_bucket('{bucket_size}', time) AS bucket,
         symbol,
         avg(sentiment_score) AS avg_sentiment
       FROM news_articles
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY day, symbol
+      GROUP BY bucket, symbol
     ),
     google_trends_daily AS (
       SELECT 
-        time_bucket('{bucket_size}', time) AS day,
+        -- Google Trends data is daily, so always bucket by day
+        time_bucket('1 day', time) AS bucket, 
         symbol,
         avg(score) AS google_score
       FROM google_trends
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY day, symbol
+      GROUP BY bucket, symbol
     ),
     prices_daily AS (
       SELECT
-        time_bucket('{bucket_size}', time) AS day,
+        -- Price data is daily, so always bucket by day
+        time_bucket('1 day', time) AS bucket,
         symbol,
-        first(price, time) as "open",
-        max(price) as "high",
-        min(price) as "low",
         last(price, time) as "close"
       FROM prices
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY day, symbol
+      GROUP BY bucket, symbol
+    ),
+    -- Create a complete time series for our desired output buckets (hourly or daily)
+    time_series AS (
+      SELECT time_bucket('{bucket_size}', g.time) AS bucket
+      FROM generate_series(
+        NOW() - INTERVAL '{time_interval}',
+        NOW(),
+        INTERVAL '{bucket_size}'
+      ) AS g(time)
+      GROUP BY bucket -- Ensure unique buckets
     )
     
-    -- The final JOIN now correctly joins on both day AND symbol
+    -- REBUILT FINAL SELECT: Join all data streams to the complete time series
     SELECT
-      p.day AS "time",
-      p.close,
-      g.google_score,
+      t.bucket AS "time",
+      
+      -- Use LOCF (Last Observation Carried Forward) to fill gaps in daily data (price/trends)
+      -- when viewing hourly charts.
+      LOCF(p.close) OVER (PARTITION BY p.symbol ORDER BY t.bucket) AS "close",
+      LOCF(g.google_score) OVER (PARTITION BY g.symbol ORDER BY t.bucket) AS "google_score",
+      
+      -- Sentiment is already bucketed at the correct {bucket_size}, so no LOCF needed.
       d.avg_sentiment
-    FROM prices_daily AS p
-    LEFT JOIN daily_sentiment AS d ON p.day = d.day AND p.symbol = d.symbol
-    LEFT JOIN google_trends_daily AS g ON p.day = g.day AND p.symbol = g.symbol
+    
+    FROM time_series AS t
+    
+    -- We must join daily data (prices) on a daily-bucketed version of the time_series
+    LEFT JOIN prices_daily AS p 
+      ON time_bucket('1 day', t.bucket) = p.bucket AND p.symbol = %s
+    
+    -- We must join daily data (trends) on a daily-bucketed version of the time_series
+    LEFT JOIN google_trends_daily AS g 
+      ON time_bucket('1 day', t.bucket) = g.bucket AND g.symbol = %s
+      
+    -- We can join sentiment directly as it's bucketed at the correct {bucket_size} (which could be hourly)
+    LEFT JOIN daily_sentiment AS d 
+      ON t.bucket = d.bucket AND d.symbol = %s
+      
     WHERE 
-      p.day > (NOW() - INTERVAL '{time_interval}')
-    ORDER BY p.day ASC;
+      t.bucket > (NOW() - INTERVAL '{time_interval}')
+    ORDER BY t.bucket ASC;
     """
     
     chart_data = []
@@ -177,8 +218,8 @@ def get_chart_data(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Pass the symbol three times, once for each WHERE clause
-        cur.execute(sql_query, (symbol, symbol, symbol))
+        # Pass the symbol 6 times, once for each WHERE clause/JOIN in the CTEs and final SELECT
+        cur.execute(sql_query, (symbol, symbol, symbol, symbol, symbol, symbol))
         
         rows = cur.fetchall()
         
@@ -244,20 +285,6 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
 
-#
-# --- Private Task Endpoints (for Cron-Job.org) ---
-#
-@app.post("/api/v1/tasks/run-prices", dependencies=[Depends(verify_secret)])
-async def trigger_price_ingest(background_tasks: BackgroundTasks):
-    """
-    Secure endpoint to trigger the price ingest task.
-    Runs in the background to avoid a timeout.
-    """
-    print("Task received: run-prices")
-    background_tasks.add_task(fetch_price_data)
-    return {"message": "Price ingest task started in the background."}
-
-
 @app.get("/api/v1/search")
 def search_symbols(query: str = Query(..., min_length=1)):
     """
@@ -297,6 +324,19 @@ def search_symbols(query: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching: {e}")
 
+#
+# --- Private Task Endpoints (for Cron-Job.org) ---
+#
+@app.post("/api/v1/tasks/run-prices", dependencies=[Depends(verify_secret)])
+async def trigger_price_ingest(background_tasks: BackgroundTasks):
+    """
+    Secure endpoint to trigger the price ingest task.
+    Runs in the background to avoid a timeout.
+    """
+    print("Task received: run-prices")
+    background_tasks.add_task(fetch_price_data)
+    return {"message": "Price ingest task started in the background."}
+
 @app.post("/api/v1/tasks/run-news", dependencies=[Depends(verify_secret)])
 async def trigger_news_ingest(background_tasks: BackgroundTasks):
     """
@@ -320,6 +360,7 @@ async def add_new_symbol(new_symbol: NewSymbol, background_tasks: BackgroundTask
     """
     Adds a new symbol to our tracked_symbols table.
     The cron jobs will automatically pick it up on their next run.
+    Secured by ADMIN_PASSWORD.
     """
     try:
         conn = get_db_connection()
