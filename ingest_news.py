@@ -2,8 +2,7 @@ import os
 import psycopg2
 import requests
 from dotenv import load_dotenv
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
+import time
 
 # Load all environment variables from .env
 load_dotenv()
@@ -11,49 +10,55 @@ load_dotenv()
 # --- Config ---
 DATABASE_URL = os.getenv('DATABASE_URL')
 NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+HF_TOKEN = os.getenv('HF_TOKEN') # Your new Hugging Face key
 SYMBOLS_TO_TRACK = ['TSLA', 'BTC']
-# Your Discord webhook for alerts (optional, but good to have)
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 # ----------------
 
 # --- AI Model Setup ---
-# Load the pre-trained FinBERT model and tokenizer
-# This will download the model (300-500MB) the first time it runs
-print("Loading FinBERT model... (This may take a moment)")
-tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-print("FinBERT model loaded.")
+# We now call the Hugging Face API instead of loading the model
+FINBERT_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 # --------------------
 
 def get_finbert_sentiment(headline):
     """
-    Analyzes a single headline and returns a compound sentiment score.
-    Score: +1 (Positive), 0 (Neutral), -1 (Negative)
+    Analyzes a single headline using the Hugging Face Inference API.
+    Returns a compound score from -1 to 1.
     """
     try:
-        # Tokenize the headline
-        inputs = tokenizer(headline, return_tensors="pt", truncation=True, max_length=512)
-        
-        # Get the model's output (logits)
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
-        # Convert logits to probabilities (softmax)
-        scores = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
-        
-        # FinBERT outputs [positive, negative, neutral]
-        # We want a single score from -1 to 1
-        # Score = (positive_prob - negative_prob)
-        compound_score = scores[0].item() - scores[1].item()
-        
+        # Send the headline to the HF API
+        json_payload = {"inputs": headline}
+        response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
+
+        # Check for errors (like 503 if model is loading)
+        if response.status_code != 200:
+            print(f"HF API Error: {response.status_code} {response.text}")
+            # If the model is loading, wait 10 seconds and try once more
+            if response.status_code == 503:
+                print("Model is loading, retrying in 10s...")
+                time.sleep(10)
+                response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
+                if response.status_code != 200:
+                     print("HF API Retry failed.")
+                     return 0 # Default to neutral on error
+            else:
+                return 0 # Default to neutral on other errors
+
+        # Parse the scores from the successful response
+        scores = response.json()[0]
+        sentiment = {s['label']: s['score'] for s in scores}
+
+        # Calculate a single compound score: (positive - negative)
+        compound_score = sentiment.get('positive', 0) - sentiment.get('negative', 0)
         return compound_score
-        
+
     except Exception as e:
         print(f"Error in sentiment analysis: {e}")
         return 0 # Default to neutral on error
 
 def send_alert(message):
-    """Sends a simple message to a Discord webhook."""
+    # (This function is the same, no changes)
     if not DISCORD_WEBHOOK_URL:
         print("ALERT (Discord webhook not set):", message)
         return
@@ -63,53 +68,48 @@ def send_alert(message):
         print(f"Error sending Discord alert: {e}")
 
 def fetch_news_data():
+    # (This entire function is the same as before)
     print("Connecting to database...")
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
-    
-    # --- 1. Fetch News ---
-    # We will search for all symbols in one go
+
     search_query = " OR ".join(SYMBOLS_TO_TRACK)
     url = (f"https://newsapi.org/v2/everything?"
            f"q=({search_query})&"
            f"language=en&"
            f"sortBy=publishedAt&"
            f"apiKey={NEWS_API_KEY}")
-    
+
     try:
         response = requests.get(url)
-        response.raise_for_status() # Raise error on 4xx/5xx
+        response.raise_for_status()
         articles = response.json().get('articles', [])
-        
+
         if not articles:
             print("No new articles found.")
             return
 
-        print(f"Found {len(articles)} articles. Analyzing sentiment and inserting...")
-        
+        print(f"Found {len(articles)} articles. Analyzing sentiment (via API) and inserting...")
+
         total_sentiment = 0
         articles_analyzed = 0
-        
+
         for article in articles:
             headline = article['title']
             if not headline:
                 continue
 
-            # --- 2. Analyze Sentiment ---
             sentiment_score = get_finbert_sentiment(headline)
-            
-            # Figure out which symbol this article is about
-            # This is a simple check; more complex logic could be added
+
             article_symbol = None
             for symbol in SYMBOLS_TO_TRACK:
                 if symbol.lower() in headline.lower():
                     article_symbol = symbol
-                    break # Assign to first symbol found
-            
+                    break
+
             if not article_symbol:
-                continue # Skip article if not clearly about our symbols
-            
-            # --- 3. Insert into Database ---
+                continue
+
             insert_query = """
             INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score)
             VALUES (%s, %s, %s, %s, %s)
@@ -122,14 +122,13 @@ def fetch_news_data():
                 article['source']['name'],
                 sentiment_score
             ))
-            
+
             total_sentiment += sentiment_score
             articles_analyzed += 1
 
         conn.commit()
         print(f"Successfully inserted/updated {articles_analyzed} articles.")
 
-        # --- 4. Check for Alert ---
         if articles_analyzed > 0:
             avg_sentiment = total_sentiment / articles_analyzed
             print(f"Average sentiment of this batch: {avg_sentiment:.4f}")
@@ -145,6 +144,5 @@ def fetch_news_data():
         conn.close()
         print("News ingest complete.")
 
-# This makes the script runnable
 if __name__ == "__main__":
     fetch_news_data()
