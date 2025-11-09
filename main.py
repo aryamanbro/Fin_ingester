@@ -248,6 +248,46 @@ async def trigger_price_ingest(background_tasks: BackgroundTasks):
     background_tasks.add_task(fetch_price_data)
     return {"message": "Price ingest task started in the background."}
 
+
+@app.get("/api/v1/search")
+def search_symbols(query: str = Query(..., min_length=1)):
+    """
+    Searches for symbols in the database.
+    """
+    # We will search for symbols that appear in EITHER
+    # the prices table OR the news table for broader results.
+    sql = """
+        (SELECT DISTINCT symbol FROM prices WHERE symbol ILIKE %s LIMIT 5)
+        UNION
+        (SELECT DISTINCT symbol FROM news_articles WHERE symbol ILIKE %s LIMIT 5)
+        LIMIT 10;
+    """
+    # We add wildcards to the query
+    search_query = f"%{query}%"
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (search_query, search_query))
+        rows = cur.fetchall()
+        
+        # We need to format this to match the mock data structure
+        results = []
+        for row in rows:
+            symbol = row[0]
+            # You can add more details here if you have a 'symbols' table
+            results.append({
+                "symbol": symbol,
+                "name": f"{symbol} Data",
+                "exchange": "Database"
+            })
+            
+        cur.close()
+        conn.close()
+        return {"data": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching: {e}")
+
 @app.post("/api/v1/tasks/run-news", dependencies=[Depends(verify_secret)])
 async def trigger_news_ingest(background_tasks: BackgroundTasks):
     """
