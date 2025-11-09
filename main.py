@@ -77,6 +77,21 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail="Database connection error")
 
 #
+# --- THIS IS THE NEW HELPER FUNCTION ---
+#
+def get_finnhub_symbol(symbol, type):
+    """Helper to format symbol for Finnhub crypto"""
+    if type == 'crypto':
+        # Assumes Binance and USDT.
+        if symbol == 'BTC':
+            return "BINANCE:BTCUSDT"
+        elif symbol == 'ETH':
+            return "BINANCE:ETHUSDT"
+        # Add other specific cryptos if needed
+        return f"BINANCE:{symbol.upper()}USDT"
+    return symbol.upper() # Return the plain symbol for stocks
+
+#
 # --- Public API Endpoints (for your React App) ---
 #
 
@@ -84,14 +99,48 @@ def get_db_connection():
 def read_root():
     return {"status": f"Sentiment API at {os.getenv('RENDER_EXTERNAL_URL', 'local')} is running"}
 
+#
+# --- THIS IS THE CORRECTED LIVE PRICE FUNCTION ---
+#
 @app.get("/api/v1/live-price")
 def get_live_price(symbol: str = Query(..., min_length=1)):
     """
     Securely fetches the current quote for a symbol.
+    This function now looks up the symbol type to correctly call Finnhub.
     """
+    symbol_type = 'stock' # Default to stock
+    finnhub_symbol = symbol.upper()
+
     try:
-        quote = finnhub_client.quote(symbol.upper())
+        # 1. Get symbol type from DB
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT type FROM tracked_symbols WHERE symbol = %s", (symbol.upper(),))
+        result = cur.fetchone()
+        if result:
+            symbol_type = result[0]
+        
+        cur.close()
+        conn.close()
+
+        # 2. Format symbol for Finnhub
+        finnhub_symbol = get_finnhub_symbol(symbol, symbol_type)
+        
+        # 3. Get quote
+        print(f"Fetching live price for {symbol} as {finnhub_symbol}...")
+        quote = finnhub_client.quote(finnhub_symbol)
+        
         if quote['c'] == 0 and quote['dp'] == 0:
+            # Finnhub might return 0 for valid symbols with no recent trade.
+            # We'll check crypto price differently if quote fails.
+            if symbol_type == 'crypto':
+                 # Fallback for crypto: use candle
+                to_ts = int(time.time())
+                from_ts = to_ts - (2 * 24 * 60 * 60) # 2 days ago
+                candle = finnhub_client.crypto_candles(finnhub_symbol, 'D', from_ts, to_ts)
+                if candle['s'] == 'ok' and len(candle['c']) > 0:
+                    return { "symbol": symbol, "price": candle['c'][-1], "change": 0, "percent_change": 0 }
+            
             raise HTTPException(status_code=404, detail="Symbol not found or no data")
         
         return {
@@ -101,6 +150,7 @@ def get_live_price(symbol: str = Query(..., min_length=1)):
             "percent_change": quote['dp']
         }
     except Exception as e:
+        print(f"Error getting live price for {symbol} (as {finnhub_symbol}): {e}")
         raise HTTPException(status_code=500, detail="Error fetching live data")
 
 @app.get("/api/v1/chart-data")
@@ -129,7 +179,7 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. THIS IS THE SIMPLIFIED QUERY (NO LOCF)
+    # 3. This is the final query (no fill-forward)
     sql_query = f"""
     WITH time_series AS (
       -- Generate a complete series of timestamps (hourly or daily)
@@ -168,8 +218,7 @@ def get_chart_data(
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY bucket
     )
-    -- Final SELECT. We've removed the LOCF logic.
-    -- This will naturally have NULL values where no data exists for a bucket.
+    -- Final SELECT. This will have NULL values where no data exists.
     SELECT
       t.bucket AS "time",
       p.close,
@@ -309,7 +358,7 @@ async def trigger_news_ingest(background_tasks: BackgroundTasks):
     return {"message": "News ingest task started in the background."}
 
 @app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
-async def trigger_trends_ingest(background_tasks: BackgroundTasks):
+async def trigger_trends_ ingest(background_tasks: BackgroundTasks):
     """
     Secure endpoint to trigger the Google Trends ingest task (for cron).
     """
