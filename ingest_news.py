@@ -125,10 +125,11 @@ def fetch_news_data():
                 
                 # --- FIX 2: Insert with 'finnhub_id' and 'url' ---
                 insert_query = """
-                INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (finnhub_id) DO NOTHING;
-                """
+                    INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                    """
+
                 cur.execute(insert_query, (
                     article_time,
                     symbol,
