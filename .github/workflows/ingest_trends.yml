@@ -1,0 +1,18 @@
+# .github/workflows/ingest-trends.yml
+name: Ingest Trends Data
+
+on:
+  schedule:
+    # Runs "at minute 0 past hour 0" (midnight UTC)
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-trends-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Trends Ingest API
+        run: |
+          curl -X POST \
+          'https://fin-ingester.onrender.com/api/v1/tasks/run-trends' \
+          -H 'X-Task-Secret: ${{ secrets.TASK_SECRET_KEY }}'

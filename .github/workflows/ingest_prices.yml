@@ -1,0 +1,18 @@
+# .github/workflows/ingest-prices.yml
+name: Ingest Price Data
+
+on:
+  schedule:
+    # Runs "at minute 0 past every 4th hour"
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-price-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Price Ingest API
+        run: |
+          curl -X POST \
+          'https://fin-ingester.onrender.com/api/v1/tasks/run-prices' \
+          -H 'X-Task-Secret: ${{ secrets.TASK_SECRET_KEY }}'

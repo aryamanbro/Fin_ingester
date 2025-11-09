@@ -1,0 +1,18 @@
+# .github/workflows/ingest-news.yml
+name: Ingest News Data
+
+on:
+  schedule:
+    # Runs "at every 30th minute" (e.g., 1:00, 1:30, 2:00)
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Allows you to run it manually from the "Actions" tab
+
+jobs:
+  run-news-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call News Ingest API
+        run: |
+          curl -X POST \
+          'https://fin-ingester.onrender.com/api/v1/tasks/run-news' \
+          -H 'X-Task-Secret: ${{ secrets.TASK_SECRET_KEY }}'
