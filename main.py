@@ -223,11 +223,11 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
 
         cur.close()
         conn.close()
-
         return {"data": news_list}
+
     except Exception as e:
         print(f"Error fetching positive news: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching news")
+        raise HTTPException(status_code=500, detail=f"Error fetching news")
 
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
@@ -257,11 +257,11 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
 
         cur.close()
         conn.close()
-
         return {"data": news_list}
+
     except Exception as e:
         print(f"Error fetching negative news: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching news")
+        raise HTTPException(status_code=500, detail=f"Error fetching news")
 
 # SEARCH
 @app.get("/api/v1/search")
