@@ -2,37 +2,55 @@ import os
 import psycopg2
 import finnhub
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+
+# ---
+# IMPORT YOUR INGESTOR SCRIPTS AS FUNCTIONS
+# This assumes ingest_prices.py has a function fetch_price_data()
+# and ingest_news.py has fetch_news_data(), etc.
+# ---
+from ingest_prices import fetch_price_data
+from ingest_news import fetch_news_data
+from ingest_trends import fetch_trends_data
 
 # Load all environment variables from .env
 load_dotenv()
 
-# --- Config ---
+# --- Configuration ---
 DATABASE_URL = os.getenv('DATABASE_URL')
 FINNHUB_KEY = os.getenv('FINNHUB_API_KEY')
-# ----------------
+TASK_SECRET_KEY = os.getenv('TASK_SECRET_KEY') # Your new secret key for cron jobs
 
-#
-# THIS IS THE CRITICAL LINE THAT WAS MISSING
-# It must be defined BEFORE you use @app
-#
+# Check for essential keys
+if not TASK_SECRET_KEY:
+    print("Error: TASK_SECRET_KEY not found in .env file.")
+    # In a real app, you might exit here
+    # exit(1)
+
+# --- App Setup ---
 app = FastAPI()
-
-# Initialize Finnhub client
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
 # --- CORS Middleware ---
-# This allows your Vercel React app to call your Render backend
+# This allows your Vercel React app to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, change this to your Vercel URL
+    # In production, change "*" to your Vercel app's URL
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Helper Function to get DB Connection ---
+# --- Security Helper ---
+async def verify_secret(x_task_secret: str = Header(None)):
+    """Verifies the secret key for cron job tasks."""
+    if x_task_secret != TASK_SECRET_KEY:
+        print(f"Failed task auth: Invalid key received.")
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid Task Secret Key")
+
+# --- Database Helper ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -41,42 +59,38 @@ def get_db_connection():
         print(f"Error connecting to database: {e}")
         raise HTTPException(status_code=500, detail="Database connection error")
 
-# --- API Endpoints ---
+#
+# --- Public API Endpoints (for your React App) ---
+#
 
 @app.get("/")
 def read_root():
-    return {"status": "Sentiment API is running"}
+    return {"status": f"Sentiment API at {os.getenv('RENDER_EXTERNAL_URL', 'local')} is running"}
 
 @app.get("/api/v1/live-price")
 def get_live_price(symbol: str = Query(..., min_length=1)):
     """
     Securely fetches the current quote for a symbol.
-    This is for your "live ticker" component in React.
     """
     try:
-        # This is a secure, backend-to-backend API call
         quote = finnhub_client.quote(symbol.upper())
-        if quote['c'] == 0:
+        if quote['c'] == 0 and quote['dp'] == 0:
             raise HTTPException(status_code=404, detail="Symbol not found or no data")
         
         return {
             "symbol": symbol,
-            "price": quote['c'],       # Current price
-            "change": quote['d'],      # Change
-            "percent_change": quote['dp'] # Percent change
+            "price": quote['c'],
+            "change": quote['d'],
+            "percent_change": quote['dp']
         }
     except Exception as e:
-        print(f"Error fetching live price for {symbol}: {e}")
         raise HTTPException(status_code=500, detail="Error fetching live data")
 
 @app.get("/api/v1/chart-data")
 def get_chart_data(symbol: str = Query(..., min_length=1)):
     """
-    Fetches all historical data (prices, sentiment, trends)
-    for the main dashboard chart. [CORRECTED VERSION]
+    Fetches all historical data for the main dashboard chart.
     """
-    
-    # This is the "Ultimate" query, now fixed.
     sql_query = """
     WITH daily_sentiment AS (
       SELECT 
@@ -102,17 +116,12 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
       SELECT
         time_bucket('1 day', time) AS day,
         symbol,
-        first(price, time) as "open",
-        max(price) as "high",
-        min(price) as "low",
         last(price, time) as "close"
       FROM prices
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '1 year')
       GROUP BY day, symbol
     )
-    
-    -- The final JOIN now correctly joins on both day AND symbol
     SELECT
       p.day AS "time",
       p.close,
@@ -130,13 +139,8 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # Pass the symbol three times, once for each WHERE clause
         cur.execute(sql_query, (symbol, symbol, symbol))
-        
         rows = cur.fetchall()
-        
-        # Get column names from the cursor
         colnames = [desc[0] for desc in cur.description]
         
         for row in rows:
@@ -144,19 +148,13 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
             
         cur.close()
         conn.close()
-        
         return {"data": chart_data}
-        
     except Exception as e:
-        print(f"Error fetching chart data for {symbol}: {e}")
-        # Send the actual database error to the client
         raise HTTPException(status_code=500, detail=f"Error fetching chart data: {e}")
 
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
-    """
-    Fetches the 10 most recent POSITIVE news articles.
-    """
+    # Fetches 10 most recent POSITIVE news articles
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
@@ -179,9 +177,7 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
 
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
-    """
-    Fetches the 10 most recent NEGATIVE news articles.
-    """
+    # Fetches 10 most recent NEGATIVE news articles
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
@@ -201,3 +197,34 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
         return {"data": news_list}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
+
+#
+# --- Private Task Endpoints (for Cron-Job.org) ---
+#
+@app.post("/api/v1/tasks/run-prices", dependencies=[Depends(verify_secret)])
+async def trigger_price_ingest(background_tasks: BackgroundTasks):
+    """
+    Secure endpoint to trigger the price ingest task.
+    Runs in the background to avoid a timeout.
+    """
+    print("Task received: run-prices")
+    background_tasks.add_task(fetch_price_data)
+    return {"message": "Price ingest task started in the background."}
+
+@app.post("/api/v1/tasks/run-news", dependencies=[Depends(verify_secret)])
+async def trigger_news_ingest(background_tasks: BackgroundTasks):
+    """
+    Secure endpoint to trigger the news and sentiment ingest task.
+    """
+    print("Task received: run-news")
+    background_tasks.add_task(fetch_news_data)
+    return {"message": "News ingest task started in the background."}
+
+@app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
+async def trigger_trends_ingest(background_tasks: BackgroundTasks):
+    """
+    Secure endpoint to trigger the Google Trends ingest task.
+    """
+    print("Task received: run-trends")
+    background_tasks.add_task(fetch_trends_data)
+    return {"message": "Trends ingest task started in the background."}
