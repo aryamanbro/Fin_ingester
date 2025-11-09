@@ -130,7 +130,6 @@ def get_chart_data(
         bucket_size = "1 hour"
 
     # 3. THIS IS THE FULLY CORRECTED QUERY
-    # This query correctly isolates the symbol *before* filling gaps.
     sql_query = f"""
     WITH time_series AS (
       -- Generate a complete series of timestamps (hourly or daily)
@@ -142,7 +141,6 @@ def get_chart_data(
       ) AS g(time)
       GROUP BY bucket
     ),
-    -- Get all data streams for the *specific symbol*
     sentiment_data AS (
       SELECT 
         time_bucket('{bucket_size}', time) AS bucket,
@@ -154,7 +152,7 @@ def get_chart_data(
     ),
     trends_data AS (
       SELECT 
-        time_bucket('1 day', time) AS bucket, 
+        time_bucket('1 day', time) AS bucket, -- Trends data is always daily
         avg(score) AS google_score
       FROM google_trends
       WHERE 
@@ -162,15 +160,17 @@ def get_chart_data(
       GROUP BY bucket
     ),
     price_data AS (
+      -- ********** THIS IS THE FIX **********
+      -- We now bucket prices by the DYNAMIC {bucket_size} (e.g., '1 hour')
+      -- This will use the hourly data you ingested.
       SELECT
-        time_bucket('1 day', time) AS bucket,
+        time_bucket('{bucket_size}', time) AS bucket,
         last(price, time) as "close"
       FROM prices
       WHERE 
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY bucket
     ),
-    -- Join all data streams to the complete time series
     joined_data AS (
       SELECT
         t.bucket,
@@ -178,22 +178,24 @@ def get_chart_data(
         g.google_score,
         s.avg_sentiment
       FROM time_series AS t
-      LEFT JOIN price_data AS p ON time_bucket('1 day', t.bucket) = p.bucket
+      -- Join price data on the correct {bucket_size}
+      LEFT JOIN price_data AS p ON t.bucket = p.bucket
+      -- Join trends data by bucketing the time_series to a day
       LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
+      -- Join sentiment data on the correct {bucket_size}
       LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
       WHERE t.bucket > (NOW() - INTERVAL '{time_interval}')
     ),
-    -- Create the "fill groups" for performing LOCF
+    -- Create the "fill groups" for performing LOCF (Last Observation Carried Forward)
     grouped_data AS (
       SELECT
         *,
-        -- Create a group ID that increments only when a non-null value is found
         count(close) OVER (ORDER BY bucket) as price_fill_group,
         count(google_score) OVER (ORDER BY bucket) as trend_fill_group,
         count(avg_sentiment) OVER (ORDER BY bucket) as sentiment_fill_group
       FROM joined_data
     )
-    -- Final select to perform the "fill" by taking the first value from each group
+    -- Final select to perform the "fill"
     SELECT
       bucket AS "time",
       first_value(close) OVER (PARTITION BY price_fill_group ORDER BY bucket) AS "close",
