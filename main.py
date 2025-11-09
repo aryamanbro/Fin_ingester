@@ -308,7 +308,7 @@ async def trigger_trends_ingest(background_tasks: BackgroundTasks):
     background_tasks.add_task(fetch_trends_data)
     return {"message": "Trends ingest task started in the background."}
 
-@app.post("/api/v1/add-symbol", dependencies=[Depends(verify_secret)])
+@app.post("/api/v1/add-symbol", dependencies=[Depends(verify_admin_password)])
 async def add_new_symbol(new_symbol: NewSymbol, background_tasks: BackgroundTasks):
     """
     Adds a new symbol to our tracked_symbols table.
