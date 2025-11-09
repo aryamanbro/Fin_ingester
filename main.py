@@ -114,119 +114,156 @@ def get_live_price(symbol: str = Query(..., min_length=1)):
 
 # CHART DATA
 @app.get("/api/v1/chart-data")
-def get_chart_data(symbol: str = Query(..., min_length=1), timeframe: str = Query("1Y")):
+def get_chart_data(
+    symbol: str = Query(..., min_length=1),
+    timeframe: str = Query("1Y", min_length=2)
+):
+    """
+    Fetches all historical data (prices, sentiment, trends)
+    for the main dashboard chart, with a dynamic timeframe.
+    """
 
-    time_interval_map = {
+    time_interval = {
         "1W": "7 days",
         "1M": "1 month",
         "1Y": "1 year",
         "ALL": "10 years"
-    }
+    }.get(timeframe, "1 year")
 
-    time_interval = time_interval_map.get(timeframe, "1 year")
     bucket_size = "1 hour" if timeframe in ["1W", "1M"] else "1 day"
 
     sql_query = f"""
-           WITH time_series AS (
-            SELECT time_bucket('{bucket_size}', g.time) AS bucket
-            FROM generate_series(
-                NOW() - INTERVAL '{time_interval}',
-                NOW(),
-                INTERVAL '{bucket_size}'
-            ) AS g(time)
-            GROUP BY bucket
-        ),
-        
-        sentiment_data AS (
-            SELECT 
-                time_bucket('{bucket_size}', time) AS bucket,
-                avg(sentiment_score) AS avg_sentiment
-            FROM news_articles
-            WHERE time > (NOW() - INTERVAL '{time_interval}')
-            GROUP BY bucket
-        ),
-        
-        trends_data AS (
-            SELECT 
-                time_bucket('1 day', time) AS bucket,
-                avg(score) AS google_score
-            FROM google_trends
-            WHERE symbol = %s
-              AND time > (NOW() - INTERVAL '{time_interval}')
-            GROUP BY bucket
-        ),
-        
-        price_data AS (
-            SELECT
-                time_bucket('{bucket_size}', time) AS bucket,
-                last(price, time) AS close
-            FROM prices
-            WHERE symbol = %s
-              AND time > (NOW() - INTERVAL '{time_interval}')
-            GROUP BY bucket
-        )
-        
+    WITH time_series AS (
+        SELECT time_bucket('{bucket_size}', g.time) AS bucket
+        FROM generate_series(
+            NOW() - INTERVAL '{time_interval}',
+            NOW(),
+            INTERVAL '{bucket_size}'
+        ) AS g(time)
+        GROUP BY bucket
+    ),
+    sentiment_data AS (
+        SELECT 
+            time_bucket('{bucket_size}', time) AS bucket,
+            AVG(sentiment_score) AS avg_sentiment
+        FROM news_articles
+        WHERE time > (NOW() - INTERVAL '{time_interval}')
+        GROUP BY bucket
+    ),
+    trends_data AS (
         SELECT
-            t.bucket AS "time",
-            p.close AS price,
-            g.google_score AS google_trends_score,
-            s.avg_sentiment AS sentiment
-        FROM time_series AS t
-        LEFT JOIN price_data AS p ON t.bucket = p.bucket
-        LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
-        LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
-        ORDER BY t.bucket ASC;
-
+            time_bucket('1 day', time) AS bucket,
+            AVG(score) AS google_score
+        FROM google_trends
+        WHERE symbol = %s
+          AND time > (NOW() - INTERVAL '{time_interval}')
+        GROUP BY bucket
+    ),
+    price_data AS (
+        SELECT
+            time_bucket('{bucket_size}', time) AS bucket,
+            LAST(price, time) AS close
+        FROM prices
+        WHERE symbol = %s
+          AND time > (NOW() - INTERVAL '{time_interval}')
+        GROUP BY bucket
+    )
+    SELECT
+        t.bucket AS time,
+        p.close AS price,
+        g.google_score AS google_trends_score,
+        s.avg_sentiment AS sentiment
+    FROM time_series AS t
+    LEFT JOIN price_data AS p ON t.bucket = p.bucket
+    LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
+    LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
+    ORDER BY t.bucket ASC;
     """
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(sql_query, (symbol, symbol))
-    rows = cur.fetchall()
-    colnames = [desc[0] for desc in cur.description]
-    cur.close()
-    conn.close()
-    return {"data": [dict(zip(colnames, row)) for row in rows]}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql_query, (symbol, symbol))
+        rows = cur.fetchall()
+        colnames = [desc[0] for desc in cur.description]
+        data = [dict(zip(colnames, row)) for row in rows]
+        cur.close()
+        conn.close()
+        return {"data": data}
+
+    except Exception as e:
+        print(f"Error fetching chart data: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching chart data")
 
 # POSITIVE NEWS
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
+    """
+    Fetches most recent positive news articles related to the chosen symbol.
+    Symbol filtering is done by matching keywords in the headline or source.
+    """
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
     WHERE sentiment_score > 0.3
+      AND (
+          LOWER(headline) LIKE '%' || LOWER(%s) || '%'
+          OR LOWER(source_name) LIKE '%' || LOWER(%s) || '%'
+      )
     ORDER BY time DESC
     LIMIT 10;
     """
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(sql, (symbol,))
-    rows = cur.fetchall()
-    colnames = [desc[0] for desc in cur.description]
-    cur.close()
-    conn.close()
-    return {"data": [dict(zip(colnames, row)) for row in rows]}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (symbol, symbol))
+        rows = cur.fetchall()
+        news_list = [
+            {"headline": r[0], "source_name": r[1], "time": r[2]} 
+            for r in rows
+        ]
+        cur.close()
+        conn.close()
+        return {"data": news_list}
+    except Exception as e:
+        print(f"Error fetching positive news: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching news")
 
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
+    """
+    Fetches most recent negative news articles related to the chosen symbol.
+    """
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
     WHERE sentiment_score < -0.3
+      AND (
+          LOWER(headline) LIKE '%' || LOWER(%s) || '%'
+          OR LOWER(source_name) LIKE '%' || LOWER(%s) || '%'
+      )
     ORDER BY time DESC
     LIMIT 10;
     """
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(sql, (symbol,))
-    rows = cur.fetchall()
-    colnames = [desc[0] for desc in cur.description]
-    cur.close()
-    conn.close()
-    return {"data": [dict(zip(colnames, row)) for row in rows]}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(sql, (symbol, symbol))
+        rows = cur.fetchall()
+        news_list = [
+            {"headline": r[0], "source_name": r[1], "time": r[2]} 
+            for r in rows
+        ]
+        cur.close()
+        conn.close()
+        return {"data": news_list}
+    except Exception as e:
+        print(f"Error fetching negative news: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching news")
+
 
 # SEARCH
 @app.get("/api/v1/search")
