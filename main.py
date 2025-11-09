@@ -127,39 +127,56 @@ def get_chart_data(symbol: str = Query(..., min_length=1), timeframe: str = Quer
     bucket_size = "1 hour" if timeframe in ["1W", "1M"] else "1 day"
 
     sql_query = f"""
-    WITH time_series AS (
-      SELECT time_bucket('{bucket_size}', g.time) AS bucket
-      FROM generate_series(
-        NOW() - INTERVAL '{time_interval}',
-        NOW(),
-        INTERVAL '{bucket_size}'
-      ) AS g(time)
-      GROUP BY bucket
-    ),
-    sentiment_data AS (
-      SELECT time_bucket('{bucket_size}', time) AS bucket, avg(sentiment_score)
-      FROM news_articles
-      WHERE symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    ),
-    trends_data AS (
-      SELECT time_bucket('1 day', time) AS bucket, avg(score)
-      FROM google_trends
-      WHERE symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    ),
-    price_data AS (
-      SELECT time_bucket('{bucket_size}', time) AS bucket, last(price, time)
-      FROM prices
-      WHERE symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    )
-    SELECT t.bucket AS time, p.last, g.avg, s.avg
-    FROM time_series AS t
-    LEFT JOIN price_data AS p ON t.bucket = p.bucket
-    LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
-    LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
-    ORDER BY t.bucket ASC;
+           WITH time_series AS (
+            SELECT time_bucket('{bucket_size}', g.time) AS bucket
+            FROM generate_series(
+                NOW() - INTERVAL '{time_interval}',
+                NOW(),
+                INTERVAL '{bucket_size}'
+            ) AS g(time)
+            GROUP BY bucket
+        ),
+        
+        sentiment_data AS (
+            SELECT 
+                time_bucket('{bucket_size}', time) AS bucket,
+                avg(sentiment_score) AS avg_sentiment
+            FROM news_articles
+            WHERE time > (NOW() - INTERVAL '{time_interval}')
+            GROUP BY bucket
+        ),
+        
+        trends_data AS (
+            SELECT 
+                time_bucket('1 day', time) AS bucket,
+                avg(score) AS google_score
+            FROM google_trends
+            WHERE symbol = %s
+              AND time > (NOW() - INTERVAL '{time_interval}')
+            GROUP BY bucket
+        ),
+        
+        price_data AS (
+            SELECT
+                time_bucket('{bucket_size}', time) AS bucket,
+                last(price, time) AS close
+            FROM prices
+            WHERE symbol = %s
+              AND time > (NOW() - INTERVAL '{time_interval}')
+            GROUP BY bucket
+        )
+        
+        SELECT
+            t.bucket AS "time",
+            p.close AS price,
+            g.google_score AS google_trends_score,
+            s.avg_sentiment AS sentiment
+        FROM time_series AS t
+        LEFT JOIN price_data AS p ON t.bucket = p.bucket
+        LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
+        LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
+        ORDER BY t.bucket ASC;
+
     """
 
     conn = get_db_connection()
@@ -177,9 +194,11 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
-    WHERE symbol = %s AND sentiment_score > 0.3
-    ORDER BY time DESC LIMIT 10;
+    WHERE sentiment_score > 0.3
+    ORDER BY time DESC
+    LIMIT 10;
     """
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(sql, (symbol,))
@@ -195,9 +214,11 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
-    WHERE symbol = %s AND sentiment_score < -0.3
-    ORDER BY time DESC LIMIT 10;
+    WHERE sentiment_score < -0.3
+    ORDER BY time DESC
+    LIMIT 10;
     """
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(sql, (symbol,))
