@@ -1,27 +1,30 @@
 import os
 import psycopg2
 import requests
+import finnhub
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import time
 
 load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+FINNHUB_KEY = os.getenv('FINNHUB_API_KEY') # Use the same key
 HF_TOKEN = os.getenv('HF_TOKEN')
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 FINBERT_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-# (Your get_finbert_sentiment and send_alert functions go here... no changes needed)
+# Setup Finnhub client
+finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
+
 def get_finbert_sentiment(headline):
-    # (Same as before)
     try:
         json_payload = {"inputs": headline}
         response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
         if response.status_code != 200:
-            if response.status_code == 503:
-                time.sleep(10)
+            if response.status_code == 503: # Model is loading
+                time.sleep(10) # Wait 10 seconds
                 response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
                 if response.status_code != 200:
                      return 0
@@ -35,7 +38,6 @@ def get_finbert_sentiment(headline):
         return 0
 
 def send_alert(message):
-    # (Same as before)
     if not DISCORD_WEBHOOK_URL:
         print("ALERT (Discord webhook not set):", message)
         return
@@ -52,81 +54,84 @@ def fetch_news_data():
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
-        # --- THIS IS THE NEW DYNAMIC LOGIC ---
         print("News Ingest Task: Fetching symbols to track from database...")
-        cur.execute("SELECT symbol FROM tracked_symbols")
-        # Convert list of tuples [('TSLA',), ('BTC',)] to a simple list ['TSLA', 'BTC']
-        symbols_list = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT symbol, type FROM tracked_symbols")
+        symbols_to_track = cur.fetchall()
         
-        if not symbols_list:
+        if not symbols_to_track:
             print("News Ingest Task: No symbols in tracked_symbols table. Exiting.")
             return
 
-        print(f"News Ingest Task: Tracking {len(symbols_list)} symbols.")
-        # Build a search query like "(TSLA OR BTC OR AAPL)"
-        search_query = f"({' OR '.join(symbols_list)})"
-        # --- END NEW LOGIC ---
+        print(f"News Ingest Task: Tracking {len(symbols_to_track)} symbols.")
         
-        url = (f"https://newsapi.org/v2/everything?"
-               f"q={search_query}&"
-               f"language=en&"
-               f"sortBy=publishedAt&"
-               f"apiKey={NEWS_API_KEY}")
-        
-        response = requests.get(url)
-        response.raise_for_status()
-        articles = response.json().get('articles', [])
-        
-        if not articles:
-            print("News Ingest Task: No new articles found.")
-            return
-
-        print(f"News Ingest Task: Found {len(articles)} articles. Analyzing...")
+        # Get news from 1 day ago
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         
         total_sentiment = 0
         articles_analyzed = 0
         
-        for article in articles:
-            headline = article['title']
-            if not headline:
-                continue
+        for symbol, type in symbols_to_track:
+            print(f"News Ingest Task: Fetching news for {symbol}...")
+            articles = []
+            try:
+                if type == 'stock':
+                    articles = finnhub_client.company_news(symbol, _from=from_date, to=to_date)
+                elif type == 'crypto':
+                    # Get general crypto news and filter by symbol
+                    general_news = finnhub_client.general_news('crypto', min_id=0)
+                    for article in general_news:
+                        if symbol.lower() in article['headline'].lower() or symbol.lower() in article['summary'].lower():
+                            articles.append(article)
+                
+                if not articles:
+                    print(f"News Ingest Task: No new articles found for {symbol}.")
+                    continue
 
-            sentiment_score = get_finbert_sentiment(headline)
-            
-            article_symbol = None
-            # Check which of our symbols is in the headline
-            for symbol in symbols_list:
-                if symbol.lower() in headline.lower():
-                    article_symbol = symbol
-                    break
-            
-            if not article_symbol:
-                continue
-            
-            insert_query = """
-            INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (time, headline) DO NOTHING;
-            """
-            cur.execute(insert_query, (
-                article['publishedAt'],
-                article_symbol,
-                headline,
-                article['source']['name'],
-                sentiment_score
-            ))
-            
-            total_sentiment += sentiment_score
-            articles_analyzed += 1
+                print(f"News Ingest Task: Found {len(articles)} articles for {symbol}. Analyzing...")
 
-        conn.commit()
-        print(f"News Ingest Task: Successfully inserted/updated {articles_analyzed} articles.")
+                for article in articles:
+                    headline = article['headline']
+                    if not headline:
+                        continue
+                    
+                    # Check if headline already exists to avoid re-analyzing
+                    cur.execute("SELECT 1 FROM news_articles WHERE headline = %s AND symbol = %s", (headline, symbol))
+                    if cur.fetchone():
+                        continue # Skip if already processed
+
+                    sentiment_score = get_finbert_sentiment(headline)
+                    article_time = datetime.fromtimestamp(article['datetime'])
+                    
+                    insert_query = """
+                    INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (time, headline) DO NOTHING;
+                    """
+                    cur.execute(insert_query, (
+                        article_time,
+                        symbol,
+                        headline,
+                        article['source'],
+                        sentiment_score
+                    ))
+                    
+                    total_sentiment += sentiment_score
+                    articles_analyzed += 1
+                
+                conn.commit()
+
+            except Exception as e:
+                print(f"Error processing news for {symbol}: {e}")
+                conn.rollback()
+
+        print(f"News Ingest Task: Successfully inserted {articles_analyzed} new articles.")
 
         if articles_analyzed > 0:
             avg_sentiment = total_sentiment / articles_analyzed
             print(f"News Ingest Task: Average sentiment: {avg_sentiment:.4f}")
             if avg_sentiment < -0.3:
-                send_alert(f"🚨 SENTIMENT ALERT 🚨\nAverage sentiment {avg_sentiment:.4f} for {search_query}")
+                send_alert(f"🚨 SENTIMENT ALERT 🚨\nAverage sentiment {avg_sentiment:.4f} for tracked symbols")
 
     except Exception as e:
         print(f"Error in fetch_news_data: {e}")
