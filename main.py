@@ -129,7 +129,7 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. THIS IS THE CORRECTED, HIGHLY-COMPATIBLE QUERY
+    # 3. This is the fully corrected, compatible query
     sql_query = f"""
     WITH daily_sentiment AS (
       SELECT 
@@ -190,7 +190,9 @@ def get_chart_data(
         -- Create a group ID that increments every time there's a new non-null price
         count(close) OVER (ORDER BY bucket) as price_fill_group,
         -- Create a group ID for trends
-        count(google_score) OVER (ORDER BY bucket) as trend_fill_group
+        count(google_score) OVER (ORDER BY bucket) as trend_fill_group,
+        -- Create a group ID for sentiment
+        count(avg_sentiment) OVER (ORDER BY bucket) as sentiment_fill_group
       FROM joined_data
     )
     -- Final select to perform the "fill"
@@ -200,7 +202,8 @@ def get_chart_data(
       first_value(close) OVER (PARTITION BY price_fill_group ORDER BY bucket) AS "close",
       -- Get the first trend value from its fill group
       first_value(google_score) OVER (PARTITION BY trend_fill_group ORDER BY bucket) AS "google_score",
-      avg_sentiment
+      -- Get the first sentiment value from its fill group
+      first_value(avg_sentiment) OVER (PARTITION BY sentiment_fill_group ORDER BY bucket) AS "avg_sentiment"
     FROM grouped_data
     ORDER BY bucket ASC;
     """
@@ -210,7 +213,7 @@ def get_chart_data(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 4. Pass the symbol 3 times (for the 3 CTEs)
+        # Pass the symbol 3 times (for the 3 CTEs)
         cur.execute(sql_query, (symbol, symbol, symbol))
         
         rows = cur.fetchall()
@@ -275,32 +278,39 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
 
+#
+# --- THIS IS THE CORRECTED FUNCTION ---
+#
 @app.get("/api/v1/search")
 def search_symbols(query: str = Query(..., min_length=1)):
     """
-    Searches for symbols in the database.
+    Searches for symbols in the master tracked_symbols table.
     """
+    # This query now correctly searches the master list of symbols
     sql = """
-        (SELECT DISTINCT symbol FROM prices WHERE symbol ILIKE %s LIMIT 5)
-        UNION
-        (SELECT DISTINCT symbol FROM news_articles WHERE symbol ILIKE %s LIMIT 5)
+        SELECT symbol, type FROM tracked_symbols 
+        WHERE symbol ILIKE %s 
         LIMIT 10;
     """
+    # We add wildcards to the query
     search_query = f"%{query}%"
     
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(sql, (search_query, search_query))
+        # Only one parameter is needed now
+        cur.execute(sql, (search_query,))
         rows = cur.fetchall()
         
         results = []
         for row in rows:
             symbol = row[0]
+            type = row[1]
+            # We can now provide a more descriptive name
             results.append({
                 "symbol": symbol,
-                "name": f"{symbol} Data",
-                "exchange": "Database"
+                "name": f"{symbol} ({type.capitalize()})",
+                "exchange": "Tracked"
             })
             
         cur.close()
