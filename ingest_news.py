@@ -57,7 +57,7 @@ def fetch_news_data():
         # --- FIX 1: Add 'url' and 'finnhub_id' columns if they don't exist ---
         try:
             cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
-            cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT UNIQUE;")
+            cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT;")
             conn.commit()
             print("News Ingest Task: Ensured 'url' and 'finnhub_id' columns exist.")
         except Exception as alter_e:
