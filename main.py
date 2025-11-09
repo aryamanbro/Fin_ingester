@@ -27,7 +27,9 @@ if not TASK_SECRET_KEY:
     print("Error: TASK_SECRET_KEY not found in .env file.")
     # In a real app, you might exit here
     # exit(1)
-
+class NewSymbol(BaseModel):
+    symbol: str
+    type: str
 # --- App Setup ---
 app = FastAPI()
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
