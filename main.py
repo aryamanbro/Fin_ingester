@@ -307,31 +307,37 @@ async def trigger_trends_ingest(background_tasks: BackgroundTasks):
     return {"message": "Trends ingest task started in the background."}
 
 @app.post("/api/v1/add-symbol", dependencies=[Depends(verify_secret)])
-async def add_new_symbol(background_tasks: BackgroundTasks, symbol: str, type: str):
+async def add_new_symbol(new_symbol: NewSymbol, background_tasks: BackgroundTasks):
     """
-    1. Adds a new symbol to our tracked_symbols table.
-    2. Immediately runs all ingestors for that new symbol to backfill data.
+    Adds a new symbol to our tracked_symbols table.
+    The cron jobs will automatically pick it up on their next run.
     """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Add the new symbol
+        # Add the new symbol to the master list
         cur.execute(
-            "INSERT INTO tracked_symbols (symbol, type) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-            (symbol.upper(), type)
+            "INSERT INTO tracked_symbols (symbol, type) VALUES (%s, %s) ON CONFLICT(symbol) DO NOTHING",
+            (new_symbol.symbol, new_symbol.type)
         )
+        rows_added = cur.rowcount
         conn.commit()
         cur.close()
         conn.close()
         
-        # Now, run the ingestors in the background for this new symbol
-        # (This is an advanced but correct way to do this)
-        # We are re-using our ingestor functions
-        background_tasks.add_task(fetch_price_data, [symbol])
-        background_tasks.add_task(fetch_news_data, [symbol])
-        background_tasks.add_task(fetch_trends_data, [symbol])
+        if rows_added == 0:
+            return {"message": f"Symbol {new_symbol.symbol} is already being tracked."}
 
-        return {"message": f"Symbol {symbol} added. Backfilling data now."}
+        # --- This is the key ---
+        # We don't need to run the full ingest.
+        # We just "pre-fill" the data by calling the scripts in the background.
+        # The cron jobs will take over from here.
+        print(f"New symbol {new_symbol.symbol} added. Triggering background backfill...")
+        background_tasks.add_task(fetch_price_data)
+        background_tasks.add_task(fetch_news_data)
+        background_tasks.add_task(fetch_trends_data)
+
+        return {"message": f"Symbol {new_symbol.symbol} added. Backfilling data now. It will appear on the dashboard shortly."}
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding symbol: {e}")
