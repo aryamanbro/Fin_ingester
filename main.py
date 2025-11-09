@@ -4,7 +4,7 @@ import finnhub
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-
+from pydantic import BaseModel
 # ---
 # IMPORT YOUR INGESTOR SCRIPTS AS FUNCTIONS
 # This assumes ingest_prices.py has a function fetch_price_data()
