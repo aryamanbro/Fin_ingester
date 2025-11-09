@@ -129,36 +129,11 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. This is the fully corrected, compatible query
+    # 3. THIS IS THE FULLY CORRECTED QUERY
+    # This query correctly isolates the symbol *before* filling gaps.
     sql_query = f"""
-    WITH daily_sentiment AS (
-      SELECT 
-        time_bucket('{bucket_size}', time) AS bucket,
-        avg(sentiment_score) AS avg_sentiment
-      FROM news_articles
-      WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    ),
-    google_trends_daily AS (
-      SELECT 
-        time_bucket('1 day', time) AS bucket, 
-        avg(score) AS google_score
-      FROM google_trends
-      WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    ),
-    prices_daily AS (
-      SELECT
-        time_bucket('1 day', time) AS bucket,
-        last(price, time) as "close"
-      FROM prices
-      WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
-      GROUP BY bucket
-    ),
-    time_series AS (
+    WITH time_series AS (
+      -- Generate a complete series of timestamps (hourly or daily)
       SELECT time_bucket('{bucket_size}', g.time) AS bucket
       FROM generate_series(
         NOW() - INTERVAL '{time_interval}',
@@ -167,42 +142,62 @@ def get_chart_data(
       ) AS g(time)
       GROUP BY bucket
     ),
-    -- New intermediate step to join data
+    -- Get all data streams for the *specific symbol*
+    sentiment_data AS (
+      SELECT 
+        time_bucket('{bucket_size}', time) AS bucket,
+        avg(sentiment_score) AS avg_sentiment
+      FROM news_articles
+      WHERE 
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
+      GROUP BY bucket
+    ),
+    trends_data AS (
+      SELECT 
+        time_bucket('1 day', time) AS bucket, 
+        avg(score) AS google_score
+      FROM google_trends
+      WHERE 
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
+      GROUP BY bucket
+    ),
+    price_data AS (
+      SELECT
+        time_bucket('1 day', time) AS bucket,
+        last(price, time) as "close"
+      FROM prices
+      WHERE 
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
+      GROUP BY bucket
+    ),
+    -- Join all data streams to the complete time series
     joined_data AS (
       SELECT
         t.bucket,
         p.close,
         g.google_score,
-        d.avg_sentiment
+        s.avg_sentiment
       FROM time_series AS t
-      -- Join daily data (prices) on a daily-bucketed version of the time_series
-      LEFT JOIN prices_daily AS p ON time_bucket('1 day', t.bucket) = p.bucket
-      -- Join daily data (trends) on a daily-bucketed version of the time_series
-      LEFT JOIN google_trends_daily AS g ON time_bucket('1 day', t.bucket) = g.bucket
-      -- Join sentiment (which is already hourly/daily) directly
-      LEFT JOIN daily_sentiment AS d ON t.bucket = d.bucket
+      LEFT JOIN price_data AS p ON time_bucket('1 day', t.bucket) = p.bucket
+      LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
+      LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
       WHERE t.bucket > (NOW() - INTERVAL '{time_interval}')
     ),
-    -- New step to create the "fill" groups for LOCF
+    -- Create the "fill groups" for performing LOCF
     grouped_data AS (
       SELECT
         *,
-        -- Create a group ID that increments every time there's a new non-null price
+        -- Create a group ID that increments only when a non-null value is found
         count(close) OVER (ORDER BY bucket) as price_fill_group,
-        -- Create a group ID for trends
         count(google_score) OVER (ORDER BY bucket) as trend_fill_group,
-        -- Create a group ID for sentiment
         count(avg_sentiment) OVER (ORDER BY bucket) as sentiment_fill_group
       FROM joined_data
     )
-    -- Final select to perform the "fill"
+    -- Final select to perform the "fill" by taking the first value from each group
     SELECT
       bucket AS "time",
-      -- Get the first price value from its fill group
       first_value(close) OVER (PARTITION BY price_fill_group ORDER BY bucket) AS "close",
-      -- Get the first trend value from its fill group
       first_value(google_score) OVER (PARTITION BY trend_fill_group ORDER BY bucket) AS "google_score",
-      -- Get the first sentiment value from its fill group
       first_value(avg_sentiment) OVER (PARTITION BY sentiment_fill_group ORDER BY bucket) AS "avg_sentiment"
     FROM grouped_data
     ORDER BY bucket ASC;
@@ -213,7 +208,7 @@ def get_chart_data(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Pass the symbol 3 times (for the 3 CTEs)
+        # Pass the symbol 3 times (once for each data CTE)
         cur.execute(sql_query, (symbol, symbol, symbol))
         
         rows = cur.fetchall()
@@ -236,7 +231,7 @@ def get_chart_data(
 def get_positive_news(symbol: str = Query(..., min_length=1)):
     # Fetches 10 most recent POSITIVE news articles
     sql = """
-    SELECT headline, source_name, time
+    SELECT headline, source_name, time, url
     FROM news_articles
     WHERE symbol = %s AND sentiment_score > 0.3
     ORDER BY time DESC
@@ -259,7 +254,7 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
 def get_negative_news(symbol: str = Query(..., min_length=1)):
     # Fetches 10 most recent NEGATIVE news articles
     sql = """
-    SELECT headline, source_name, time
+    SELECT headline, source_name, time, url
     FROM news_articles
     WHERE symbol = %s AND sentiment_score < -0.3
     ORDER BY time DESC
@@ -278,27 +273,21 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching news: {e}")
 
-#
-# --- THIS IS THE CORRECTED FUNCTION ---
-#
 @app.get("/api/v1/search")
 def search_symbols(query: str = Query(..., min_length=1)):
     """
     Searches for symbols in the master tracked_symbols table.
     """
-    # This query now correctly searches the master list of symbols
     sql = """
         SELECT symbol, type FROM tracked_symbols 
         WHERE symbol ILIKE %s 
         LIMIT 10;
     """
-    # We add wildcards to the query
     search_query = f"%{query}%"
     
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Only one parameter is needed now
         cur.execute(sql, (search_query,))
         rows = cur.fetchall()
         
@@ -306,7 +295,6 @@ def search_symbols(query: str = Query(..., min_length=1)):
         for row in rows:
             symbol = row[0]
             type = row[1]
-            # We can now provide a more descriptive name
             results.append({
                 "symbol": symbol,
                 "name": f"{symbol} ({type.capitalize()})",
