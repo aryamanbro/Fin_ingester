@@ -305,3 +305,33 @@ async def trigger_trends_ingest(background_tasks: BackgroundTasks):
     print("Task received: run-trends")
     background_tasks.add_task(fetch_trends_data)
     return {"message": "Trends ingest task started in the background."}
+
+@app.post("/api/v1/add-symbol", dependencies=[Depends(verify_secret)])
+async def add_new_symbol(background_tasks: BackgroundTasks, symbol: str, type: str):
+    """
+    1. Adds a new symbol to our tracked_symbols table.
+    2. Immediately runs all ingestors for that new symbol to backfill data.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Add the new symbol
+        cur.execute(
+            "INSERT INTO tracked_symbols (symbol, type) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (symbol.upper(), type)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        # Now, run the ingestors in the background for this new symbol
+        # (This is an advanced but correct way to do this)
+        # We are re-using our ingestor functions
+        background_tasks.add_task(fetch_price_data, [symbol])
+        background_tasks.add_task(fetch_news_data, [symbol])
+        background_tasks.add_task(fetch_trends_data, [symbol])
+
+        return {"message": f"Symbol {symbol} added. Backfilling data now."}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error adding symbol: {e}")
