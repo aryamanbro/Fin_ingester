@@ -87,41 +87,69 @@ def get_live_price(symbol: str = Query(..., min_length=1)):
         raise HTTPException(status_code=500, detail="Error fetching live data")
 
 @app.get("/api/v1/chart-data")
-def get_chart_data(symbol: str = Query(..., min_length=1)):
+def get_chart_data(
+    symbol: str = Query(..., min_length=1),
+    timeframe: str = Query("1Y", min_length=2) # Add timeframe, default to 1Y
+):
     """
-    Fetches all historical data for the main dashboard chart.
+    Fetches all historical data (prices, sentiment, trends)
+    for the main dashboard chart, with a dynamic timeframe.
     """
-    sql_query = """
+
+    # 1. Convert timeframe to a SQL INTERVAL
+    time_interval = "1 year" # Default
+    if timeframe == "1W":
+        time_interval = "7 days"
+    elif timeframe == "1M":
+        time_interval = "1 month"
+    elif timeframe == "1Y":
+        time_interval = "1 year"
+    elif timeframe == "ALL":
+        time_interval = "10 years" # "All"
+
+    # 2. Determine the bucket size for grouping
+    # For 1W/1M, we bucket by hour. For 1Y/ALL, we bucket by day.
+    bucket_size = "1 day"
+    if timeframe in ["1W", "1M"]:
+        bucket_size = "1 hour"
+
+    # This is the "Ultimate" query, now with dynamic timeframe and bucketing
+    sql_query = f"""
     WITH daily_sentiment AS (
       SELECT 
-        time_bucket('1 day', time) AS day,
+        time_bucket('{bucket_size}', time) AS day,
         symbol,
         avg(sentiment_score) AS avg_sentiment
       FROM news_articles
       WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '1 year')
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY day, symbol
     ),
     google_trends_daily AS (
       SELECT 
-        time_bucket('1 day', time) AS day,
+        time_bucket('{bucket_size}', time) AS day,
         symbol,
         avg(score) AS google_score
       FROM google_trends
       WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '1 year')
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY day, symbol
     ),
     prices_daily AS (
       SELECT
-        time_bucket('1 day', time) AS day,
+        time_bucket('{bucket_size}', time) AS day,
         symbol,
+        first(price, time) as "open",
+        max(price) as "high",
+        min(price) as "low",
         last(price, time) as "close"
       FROM prices
       WHERE 
-        symbol = %s AND time > (NOW() - INTERVAL '1 year')
+        symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY day, symbol
     )
+    
+    -- The final JOIN now correctly joins on both day AND symbol
     SELECT
       p.day AS "time",
       p.close,
@@ -131,7 +159,7 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
     LEFT JOIN daily_sentiment AS d ON p.day = d.day AND p.symbol = d.symbol
     LEFT JOIN google_trends_daily AS g ON p.day = g.day AND p.symbol = g.symbol
     WHERE 
-      p.day > (NOW() - INTERVAL '1 year')
+      p.day > (NOW() - INTERVAL '{time_interval}')
     ORDER BY p.day ASC;
     """
     
@@ -139,8 +167,13 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # Pass the symbol three times, once for each WHERE clause
         cur.execute(sql_query, (symbol, symbol, symbol))
+        
         rows = cur.fetchall()
+        
+        # Get column names from the cursor
         colnames = [desc[0] for desc in cur.description]
         
         for row in rows:
@@ -148,8 +181,12 @@ def get_chart_data(symbol: str = Query(..., min_length=1)):
             
         cur.close()
         conn.close()
+        
         return {"data": chart_data}
+        
     except Exception as e:
+        print(f"Error fetching chart data for {symbol}: {e}")
+        # Send the actual database error to the client
         raise HTTPException(status_code=500, detail=f"Error fetching chart data: {e}")
 
 @app.get("/api/v1/positive-news")
