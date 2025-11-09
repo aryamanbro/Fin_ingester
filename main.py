@@ -8,8 +8,6 @@ from pydantic import BaseModel
 
 # ---
 # IMPORT YOUR INGESTOR SCRIPTS AS FUNCTIONS
-# This assumes ingest_prices.py has a function fetch_price_data()
-# and ingest_news.py has fetch_news_data(), etc.
 # ---
 from ingest_prices import fetch_price_data
 from ingest_news import fetch_news_data
@@ -108,16 +106,11 @@ def get_live_price(symbol: str = Query(..., min_length=1)):
 @app.get("/api/v1/chart-data")
 def get_chart_data(
     symbol: str = Query(..., min_length=1),
-    timeframe: str = Query("1Y", min_length=2) # Add timeframe, default to 1Y
+    timeframe: str = Query("1Y", min_length=2)
 ):
     """
     Fetches all historical data (prices, sentiment, trends)
     for the main dashboard chart, with a dynamic timeframe.
-    
-    This query is designed to handle mixed granularities:
-    - Prices are daily (filled forward for hourly views).
-    - Sentiment can be hourly.
-    - Trends are daily (filled forward for hourly views).
     """
 
     # 1. Convert timeframe to a SQL INTERVAL
@@ -136,8 +129,8 @@ def get_chart_data(
     if timeframe in ["1W", "1M"]:
         bucket_size = "1 hour"
 
-    # 3. This is the new, fixed query
-    # This assumes TimescaleDB is installed for time_bucket, LOCF, and generate_series.
+    # 3. THIS IS THE CORRECTED QUERY
+    # We replace `LOCF(...)` with `last_value(...) IGNORE NULLS OVER (...)`
     sql_query = f"""
     WITH daily_sentiment AS (
       SELECT 
@@ -151,7 +144,6 @@ def get_chart_data(
     ),
     google_trends_daily AS (
       SELECT 
-        -- Google Trends data is daily, so always bucket by day
         time_bucket('1 day', time) AS bucket, 
         symbol,
         avg(score) AS google_score
@@ -162,7 +154,6 @@ def get_chart_data(
     ),
     prices_daily AS (
       SELECT
-        -- Price data is daily, so always bucket by day
         time_bucket('1 day', time) AS bucket,
         symbol,
         last(price, time) as "close"
@@ -171,7 +162,6 @@ def get_chart_data(
         symbol = %s AND time > (NOW() - INTERVAL '{time_interval}')
       GROUP BY bucket, symbol
     ),
-    -- Create a complete time series for our desired output buckets (hourly or daily)
     time_series AS (
       SELECT time_bucket('{bucket_size}', g.time) AS bucket
       FROM generate_series(
@@ -179,32 +169,32 @@ def get_chart_data(
         NOW(),
         INTERVAL '{bucket_size}'
       ) AS g(time)
-      GROUP BY bucket -- Ensure unique buckets
+      GROUP BY bucket
     )
     
-    -- REBUILT FINAL SELECT: Join all data streams to the complete time series
     SELECT
       t.bucket AS "time",
       
-      -- Use LOCF (Last Observation Carried Forward) to fill gaps in daily data (price/trends)
-      -- when viewing hourly charts.
-      LOCF(p.close) OVER (PARTITION BY p.symbol ORDER BY t.bucket) AS "close",
-      LOCF(g.google_score) OVER (PARTITION BY g.symbol ORDER BY t.bucket) AS "google_score",
+      -- CORRECTED "Last Observation Carried Forward"
+      last_value(p.close) IGNORE NULLS OVER (
+          PARTITION BY p.symbol 
+          ORDER BY t.bucket 
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS "close",
       
-      -- Sentiment is already bucketed at the correct {bucket_size}, so no LOCF needed.
+      last_value(g.google_score) IGNORE NULLS OVER (
+          PARTITION BY g.symbol 
+          ORDER BY t.bucket 
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS "google_score",
+      
       d.avg_sentiment
     
     FROM time_series AS t
-    
-    -- We must join daily data (prices) on a daily-bucketed version of the time_series
     LEFT JOIN prices_daily AS p 
       ON time_bucket('1 day', t.bucket) = p.bucket AND p.symbol = %s
-    
-    -- We must join daily data (trends) on a daily-bucketed version of the time_series
     LEFT JOIN google_trends_daily AS g 
       ON time_bucket('1 day', t.bucket) = g.bucket AND g.symbol = %s
-      
-    -- We can join sentiment directly as it's bucketed at the correct {bucket_size} (which could be hourly)
     LEFT JOIN daily_sentiment AS d 
       ON t.bucket = d.bucket AND d.symbol = %s
       
@@ -218,12 +208,11 @@ def get_chart_data(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Pass the symbol 6 times, once for each WHERE clause/JOIN in the CTEs and final SELECT
+        # Pass the symbol 6 times, once for each WHERE/JOIN
         cur.execute(sql_query, (symbol, symbol, symbol, symbol, symbol, symbol))
         
         rows = cur.fetchall()
         
-        # Get column names from the cursor
         colnames = [desc[0] for desc in cur.description]
         
         for row in rows:
@@ -236,7 +225,6 @@ def get_chart_data(
         
     except Exception as e:
         print(f"Error fetching chart data for {symbol}: {e}")
-        # Send the actual database error to the client
         raise HTTPException(status_code=500, detail=f"Error fetching chart data: {e}")
 
 @app.get("/api/v1/positive-news")
@@ -290,15 +278,12 @@ def search_symbols(query: str = Query(..., min_length=1)):
     """
     Searches for symbols in the database.
     """
-    # We will search for symbols that appear in EITHER
-    # the prices table OR the news table for broader results.
     sql = """
         (SELECT DISTINCT symbol FROM prices WHERE symbol ILIKE %s LIMIT 5)
         UNION
         (SELECT DISTINCT symbol FROM news_articles WHERE symbol ILIKE %s LIMIT 5)
         LIMIT 10;
     """
-    # We add wildcards to the query
     search_query = f"%{query}%"
     
     try:
@@ -307,11 +292,9 @@ def search_symbols(query: str = Query(..., min_length=1)):
         cur.execute(sql, (search_query, search_query))
         rows = cur.fetchall()
         
-        # We need to format this to match the mock data structure
         results = []
         for row in rows:
             symbol = row[0]
-            # You can add more details here if you have a 'symbols' table
             results.append({
                 "symbol": symbol,
                 "name": f"{symbol} Data",
@@ -325,13 +308,12 @@ def search_symbols(query: str = Query(..., min_length=1)):
         raise HTTPException(status_code=500, detail=f"Error searching: {e}")
 
 #
-# --- Private Task Endpoints (for Cron-Job.org) ---
+# --- Private Task Endpoints (for Cron-Job.org & Admin) ---
 #
 @app.post("/api/v1/tasks/run-prices", dependencies=[Depends(verify_secret)])
 async def trigger_price_ingest(background_tasks: BackgroundTasks):
     """
-    Secure endpoint to trigger the price ingest task.
-    Runs in the background to avoid a timeout.
+    Secure endpoint to trigger the price ingest task (for cron).
     """
     print("Task received: run-prices")
     background_tasks.add_task(fetch_price_data)
@@ -340,7 +322,7 @@ async def trigger_price_ingest(background_tasks: BackgroundTasks):
 @app.post("/api/v1/tasks/run-news", dependencies=[Depends(verify_secret)])
 async def trigger_news_ingest(background_tasks: BackgroundTasks):
     """
-    Secure endpoint to trigger the news and sentiment ingest task.
+    Secure endpoint to trigger the news ingest task (for cron).
     """
     print("Task received: run-news")
     background_tasks.add_task(fetch_news_data)
@@ -349,7 +331,7 @@ async def trigger_news_ingest(background_tasks: BackgroundTasks):
 @app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
 async def trigger_trends_ingest(background_tasks: BackgroundTasks):
     """
-    Secure endpoint to trigger the Google Trends ingest task.
+    Secure endpoint to trigger the Google Trends ingest task (for cron).
     """
     print("Task received: run-trends")
     background_tasks.add_task(fetch_trends_data)
@@ -359,13 +341,12 @@ async def trigger_trends_ingest(background_tasks: BackgroundTasks):
 async def add_new_symbol(new_symbol: NewSymbol, background_tasks: BackgroundTasks):
     """
     Adds a new symbol to our tracked_symbols table.
-    The cron jobs will automatically pick it up on their next run.
     Secured by ADMIN_PASSWORD.
     """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Add the new symbol to the master list
+        
         cur.execute(
             "INSERT INTO tracked_symbols (symbol, type) VALUES (%s, %s) ON CONFLICT(symbol) DO NOTHING",
             (new_symbol.symbol, new_symbol.type)
@@ -378,10 +359,6 @@ async def add_new_symbol(new_symbol: NewSymbol, background_tasks: BackgroundTask
         if rows_added == 0:
             return {"message": f"Symbol {new_symbol.symbol} is already being tracked."}
 
-        # --- This is the key ---
-        # We don't need to run the full ingest.
-        # We just "pre-fill" the data by calling the scripts in the background.
-        # The cron jobs will take over from here.
         print(f"New symbol {new_symbol.symbol} added. Triggering background backfill...")
         background_tasks.add_task(fetch_price_data)
         background_tasks.add_task(fetch_news_data)
