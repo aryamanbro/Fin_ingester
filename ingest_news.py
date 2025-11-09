@@ -54,6 +54,17 @@ def fetch_news_data():
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
+        # --- This is a failsafe. If the 'url' column doesn't exist, add it. ---
+        # This makes the fix idempotent.
+        try:
+            cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
+            conn.commit()
+            print("News Ingest Task: Ensured 'url' column exists.")
+        except Exception as alter_e:
+            print(f"Warning: Could not add 'url' column (it might exist): {alter_e}")
+            conn.rollback() # Rollback the ALTER TABLE, but continue the script
+        # ----------------------------------------------------------------------
+            
         print("News Ingest Task: Fetching symbols to track from database...")
         cur.execute("SELECT symbol, type FROM tracked_symbols")
         symbols_to_track = cur.fetchall()
@@ -92,6 +103,8 @@ def fetch_news_data():
 
                 for article in articles:
                     headline = article['headline']
+                    article_url = article['url'] # Get the URL
+                    
                     if not headline:
                         continue
                     
@@ -103,17 +116,21 @@ def fetch_news_data():
                     sentiment_score = get_finbert_sentiment(headline)
                     article_time = datetime.fromtimestamp(article['datetime'])
                     
+                    # --- THIS IS THE FIX ---
+                    # Added 'url' to the query
                     insert_query = """
-                    INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (time, headline) DO NOTHING;
                     """
+                    # Added 'article_url' to the parameters
                     cur.execute(insert_query, (
                         article_time,
                         symbol,
                         headline,
                         article['source'],
-                        sentiment_score
+                        sentiment_score,
+                        article_url 
                     ))
                     
                     total_sentiment += sentiment_score
