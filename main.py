@@ -198,10 +198,7 @@ def get_chart_data(
 # POSITIVE NEWS
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
-    """
-    Fetches most recent positive news articles related to the chosen symbol.
-    Symbol filtering is done by matching keywords in the headline or source.
-    """
+
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
@@ -219,12 +216,14 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
         cur = conn.cursor()
         cur.execute(sql, (symbol, symbol))
         rows = cur.fetchall()
-        news_list = [
-            {"headline": r[0], "source_name": r[1], "time": r[2]} 
-            for r in rows
-        ]
+
+        colnames = [desc[0] for desc in cur.description]
+
+        news_list = [dict(zip(colnames, row)) for row in rows]
+
         cur.close()
         conn.close()
+
         return {"data": news_list}
     except Exception as e:
         print(f"Error fetching positive news: {e}")
@@ -233,9 +232,7 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
-    """
-    Fetches most recent negative news articles related to the chosen symbol.
-    """
+
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
@@ -253,17 +250,18 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
         cur = conn.cursor()
         cur.execute(sql, (symbol, symbol))
         rows = cur.fetchall()
-        news_list = [
-            {"headline": r[0], "source_name": r[1], "time": r[2]} 
-            for r in rows
-        ]
+
+        colnames = [desc[0] for desc in cur.description]
+
+        news_list = [dict(zip(colnames, row)) for row in rows]
+
         cur.close()
         conn.close()
+
         return {"data": news_list}
     except Exception as e:
         print(f"Error fetching negative news: {e}")
         raise HTTPException(status_code=500, detail="Error fetching news")
-
 
 # SEARCH
 @app.get("/api/v1/search")
