@@ -111,71 +111,19 @@ def fetch_crypto(symbol):
 # Main ingestion driver
 # -------------------------------------------
 def fetch_price_data():
-    print("Price Ingest: Starting...")
+    print("DEBUG: I am inside fetch_price_data() NOW!")  # <-- Confirm entry
 
     try:
-        conn = get_db()
-        cur = conn.cursor()
+        print("DEBUG: Starting DB connection...")
+        conn = psycopg2.connect(DATABASE_URL)
+        print("DEBUG: Database connected!")
 
-        cur.execute("SELECT symbol, type FROM tracked_symbols;")
-        tracked = cur.fetchall()
-
-        for symbol, type_ in tracked:
-            total_inserted = 0
-
-            if type_ == "stock":
-                data = fetch_stock(symbol)
-                # Daily
-                for row in data["daily"]:
-                    # FMP daily example row:
-                    # {"date": "2024-11-01", "close": 260.21, "volume": 1000000}
-                    try:
-                        ts = datetime.strptime(row["date"], "%Y-%m-%d")
-                        price = row["close"]
-                        volume = row.get("volume", 0)
-                        insert_row(cur, symbol, ts, price, volume)
-                        total_inserted += 1
-                    except:
-                        pass
-
-                # Hourly
-                for row in data["hourly"]:
-                    # Hourly row example:
-                    # {"date": "2024-11-12 10:00:00", "close": 260.21, "volume": 100000}
-                    try:
-                        ts = datetime.strptime(row["date"], "%Y-%m-%d %H:%M:%S")
-                        price = row["close"]
-                        volume = row.get("volume", 0)
-                        insert_row(cur, symbol, ts, price, volume)
-                        total_inserted += 1
-                    except:
-                        pass
-
-            elif type_ == "crypto":
-                data = fetch_crypto(symbol)
-
-                # DAILY
-                for ts_ms, price in data["daily"]:
-                    ts = datetime.utcfromtimestamp(ts_ms / 1000)
-                    insert_row(cur, symbol, ts, price, 0)
-                    total_inserted += 1
-
-                # HOURLY
-                for ts_ms, price in data["hourly"]:
-                    ts = datetime.utcfromtimestamp(ts_ms / 1000)
-                    insert_row(cur, symbol, ts, price, 0)
-                    total_inserted += 1
-
-            conn.commit()
-            print(f"[OK] Inserted {total_inserted} points for {symbol}")
+        # continue existing code...
 
     except Exception as e:
-        print("Price Ingest FAILED:", e)
+        print("DEBUG ERROR: ", e)
+        raise
 
-    finally:
-        cur.close()
-        conn.close()
-        print("Price Ingest: Complete ✅")
 
 if __name__ == "__main__":
     fetch_price_data()
