@@ -151,7 +151,7 @@ def fetch_news_data():
                 cur.execute("""
                     INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (finnhub_id) DO NOTHING;
+                    ON CONFLICT (finnhub_id, time) DO NOTHING;
                 """, (dt, symbol, headline, source, score, url, finnhub_id))
 
                 if cur.rowcount > 0:
