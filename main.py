@@ -235,3 +235,43 @@ def add_symbol(new: NewSymbol):
         return {"status": f"{new.symbol} added"}
     except Exception as e:
         raise HTTPException(500, str(e))
+# ---------------------------
+# Search tracked symbols only
+# ---------------------------
+@app.get("/api/v1/search")
+def search_symbols(query: str = Query(..., min_length=1)):
+    """
+    Search symbols already tracked in your DB.
+    Returns at most 10 matches from tracked_symbols.
+    """
+    try:
+        like = f"%{query}%"
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT symbol, type
+            FROM tracked_symbols
+            WHERE symbol ILIKE %s
+            ORDER BY symbol ASC
+            LIMIT 10;
+            """,
+            (like,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return {
+            "data": [
+                {
+                    "symbol": r["symbol"],
+                    "name": f'{r["symbol"]} ({r["type"].capitalize()})',
+                    "exchange": "Tracked"
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        print("Search error:", e)
+        raise HTTPException(status_code=500, detail="Error searching tracked symbols")
