@@ -2,103 +2,127 @@ import os
 import psycopg2
 import finnhub
 import time
+import requests
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+FINBERT_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
-sentiment = SentimentIntensityAnalyzer()
+
+
+def analyze_with_finbert(headline: str) -> float:
+    """
+    Calls HuggingFace FinBERT model and returns sentiment score.
+    Score = positive - negative
+    """
+    try:
+        payload = {"inputs": headline}
+        r = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=payload)
+
+        # Model loading delay handling
+        if r.status_code == 503:
+            time.sleep(8)
+            r = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=payload)
+
+        if r.status_code != 200:
+            print("[FINBERT ERROR]", r.text)
+            return 0.0
+
+        result = r.json()
+        if not isinstance(result, list) or len(result) == 0:
+            return 0.0
+
+        scores = result[0]
+        sentiment = {item["label"]: item["score"] for item in scores}
+
+        pos = sentiment.get("positive", 0)
+        neg = sentiment.get("negative", 0)
+
+        return pos - neg
+
+    except Exception as e:
+        print("ERROR in FinBERT:", e)
+        return 0.0
 
 
 def fetch_news_data():
-    print("News Ingest Task: Connecting to database...")
+    print("News ingestion starting...")
+
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # ----------------------------------------------------------------------
-    # 🛑 ENSURE columns exist (safe)
-    # ----------------------------------------------------------------------
-    try:
-        cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
-        cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT;")
-        conn.commit()
-        print("News Ingest Task: Ensured 'url' and 'finnhub_id' columns exist.")
-    except Exception as e:
-        print("Warning: Could not alter table:", e)
+    # Ensure schema fixes
+    cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
+    cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT UNIQUE;")
+    conn.commit()
 
-    # ----------------------------------------------------------------------
-    # ✅ Fetch tracked symbols 
-    # ----------------------------------------------------------------------
-    cur.execute("SELECT symbol FROM tracked_symbols;")
-    symbols = [row[0] for row in cur.fetchall()]
-    print(f"News Ingest Task: Tracking {len(symbols)} symbols.")
+    cur.execute("SELECT symbol, type FROM tracked_symbols")
+    symbols = cur.fetchall()
 
-    all_articles = []
-    for sym in symbols:
-        print(f"News Ingest Task: Fetching news for {sym}...")
+    print(f"Tracking {len(symbols)} symbols")
+
+    from_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    to_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    seen_articles = {}
+
+    # 1. Fetch news
+    for symbol, sym_type in symbols:
         try:
-            articles = finnhub_client.company_news(sym, _from="2024-01-01", to=time.strftime("%Y-%m-%d"))
+            if sym_type == "stock":
+                articles = finnhub_client.company_news(symbol, _from=from_date, to=to_date)
+            else:
+                general = finnhub_client.general_news("crypto", min_id=0)
+                articles = [a for a in general if symbol.lower() in a["headline"].lower()]
+
+            for a in articles:
+                if a["id"] not in seen_articles:
+                    seen_articles[a["id"]] = a
+
         except Exception as e:
-            print(f"Error fetching news for {sym}: {e}")
-            continue
+            print(f"Error fetching {symbol}: {e}")
 
-        for a in articles:
-            if "headline" in a and "id" in a:
-                all_articles.append({
-                    "symbol": sym,
-                    "time": a.get("datetime"),
-                    "headline": a.get("headline"),
-                    "source": a.get("source"),
-                    "url": a.get("url", None),
-                    "finnhub_id": a.get("id"),
-                })
+    print(f"Found {len(seen_articles)} unique news articles")
 
-    print(f"News Ingest Task: Found {len(all_articles)} raw articles.")
+    # 2. Insert with FinBERT
+    inserted = 0
 
-    # ----------------------------------------------------------------------
-    # ✅ Remove duplicates before sentiment
-    # ----------------------------------------------------------------------
-    seen_ids = set()
-    unique_articles = []
-    for a in all_articles:
-        if a["finnhub_id"] not in seen_ids:
-            seen_ids.add(a["finnhub_id"])
-            unique_articles.append(a)
-
-    print(f"News Ingest Task: {len(unique_articles)} unique articles after deduplication.")
-
-    # ----------------------------------------------------------------------
-    # ✅ Insert using UPSERT with UNIQUE(time, finnhub_id)
-    # ----------------------------------------------------------------------
-    insert_sql = """
-        INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
-        VALUES (TO_TIMESTAMP(%s), %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (time, finnhub_id) DO NOTHING;
-    """
-
-    insert_count = 0
-
-    for art in unique_articles:
-        sent = sentiment.polarity_scores(art["headline"])["compound"]
-
+    for fid, article in seen_articles.items():
         try:
-            cur.execute(
-                insert_sql,
-                (art["time"], art["symbol"], art["headline"],
-                 art["source"], sent, art["url"], art["finnhub_id"])
-            )
-            insert_count += cur.rowcount
+            headline = article["headline"]
+            url = article.get("url", "")
+            ts = datetime.utcfromtimestamp(article["datetime"])  # fix: valid timestamp
+
+            score = analyze_with_finbert(headline)
+
+            cur.execute("""
+                INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (finnhub_id) DO NOTHING;
+            """, (
+                ts,
+                article["related"] or symbol,
+                headline,
+                article["source"],
+                score,
+                url,
+                fid
+            ))
+
+            inserted += cur.rowcount
+
         except Exception as e:
             print("Insert error:", e)
-            continue
 
     conn.commit()
-    cur.close()
     conn.close()
 
-    print(f"News Ingest Task: Successfully inserted {insert_count} articles.")
-    print("News Ingest Task: Complete.")
-
+    print(f"Inserted {inserted} new articles using FINBERT.")
