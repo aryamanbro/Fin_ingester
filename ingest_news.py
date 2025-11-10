@@ -1,187 +1,136 @@
 import os
-import requests
 import psycopg2
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from datetime import datetime
-import time
+import finnhub
+import requests
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+
+load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-FINNHUB_NEWS_URL = "https://finnhub.io/api/v1/company-news"
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
+finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
-HEADERS = {
+FINBERT_API_URL = "https://router.huggingface.co/hf-inference/ProsusAI/finbert"
+FINBERT_HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
-    "x-use-cache": "0",
+    "Content-Type": "application/json"
 }
 
-vader = SentimentIntensityAnalyzer()
-
-
-# ======================================================
-# ✅ DATABASE HELPER
-# ======================================================
-def db():
+def get_db():
     return psycopg2.connect(DATABASE_URL)
 
+def clean_text(text: str) -> str:
+    return text.replace("\n", " ").replace("\r", " ").strip()[:450]
 
-# ======================================================
-# ✅ SAFE FINBERT CALL — with retry + fallback
-# ======================================================
-def finbert_sentiment(text):
-    if HF_TOKEN is None or HF_TOKEN.strip() == "":
-        return None  # will fallback to VADER
+def analyze_sentiment_finbert(text):
+    """
+    FinBERT-only sentiment evaluation.
+    If request fails -> return 0.0 (neutral).
+    """
+    try:
+        response = requests.post(
+            FINBERT_API_URL,
+            headers=FINBERT_HEADERS,
+            json={"inputs": text},
+            timeout=10
+        )
 
-    for attempt in range(3):
-        try:
-            resp = requests.post(HF_API_URL, json={"inputs": text}, headers=HEADERS, timeout=25)
+        if response.status_code != 200:
+            print(f"[FinBERT ERROR] status={response.status_code} → {response.text}")
+            return 0.0
 
-            if resp.status_code != 200:
-                print(f"[FinBERT HTTP ERROR] {resp.status_code}: {resp.text}")
-                continue
+        data = response.json()
 
-            data = resp.json()
+        # FinBERT returns list of dicts:
+        # [{"label": "positive", "score": 0.98}, ...]
+        if isinstance(data, list) and len(data) > 0:
+            label = data[0]["label"].lower()
+            score = float(data[0]["score"])
 
-            if "error" in data:
-                print(f"[FinBERT ERROR] {data['error']}")
-                continue
+            if label == "positive":
+                return score
+            elif label == "negative":
+                return -score
+            else:
+                return 0.0
 
-            # Expected output:
-            # [[{"label": "positive", "score": 0.98}, ...]]
-            scores = data[0]
-            score_map = {s["label"]: s["score"] for s in scores}
+        return 0.0
 
-            compound = score_map.get("positive", 0) - score_map.get("negative", 0)
-            return compound
-
-        except Exception as e:
-            print(f"[FinBERT Exception] {e}")
-            time.sleep(1)
-
-    return None  # fallback triggers
-
-
-# ======================================================
-# ✅ FALLBACK SENTIMENT (VADER)
-# ======================================================
-def vader_sentiment(text):
-    s = vader.polarity_scores(text)
-    return s["compound"]
+    except Exception as e:
+        print(f"[FinBERT ERROR] {e}")
+        return 0.0
 
 
-# ======================================================
-# ✅ MAIN NEWS INGEST FUNCTION
-# ======================================================
 def fetch_news_data():
     print("News ingestion starting...")
     print("===============================")
 
-    # ----- 1️⃣ Fetch symbols from DB -----
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT symbol FROM tracked_symbols")
-        symbols = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print("[ERROR] Could not fetch tracked symbols:", e)
-        return
+    conn = get_db()
+    cur = conn.cursor()
 
+    # ✅ Ensure columns exist without UNIQUE constraints
+    # Do NOT add UNIQUE here – it breaks hypertable partition rules.
+    cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS url TEXT;")
+    cur.execute("ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS finnhub_id BIGINT;")
+    conn.commit()
+    print("[INFO] Columns 'url' and 'finnhub_id' confirmed.")
+
+    # ✅ Fetch tracked symbols
+    cur.execute("SELECT symbol FROM tracked_symbols;")
+    symbols = [row[0] for row in cur.fetchall()]
     print(f"[INFO] Tracking {len(symbols)} symbols...")
 
-    # ----- 2️⃣ Fetch FINNHUB news for each symbol -----
-    all_articles = []
+    raw_articles = []
 
     for sym in symbols:
         print(f"[FETCH] Fetching news for {sym}...")
         try:
-            url = f"{FINNHUB_NEWS_URL}?symbol={sym}&from=2020-01-01&to=2030-01-01&token={FINNHUB_API_KEY}"
-            r = requests.get(url, timeout=20)
-            if r.status_code != 200:
-                print(f"[WARN] Finnhub returned {r.status_code} for {sym}")
+            news = finnhub_client.company_news(sym, _from="2024-01-01", to="2030-01-01")
+            raw_articles.extend(news)
+        except Exception as e:
+            print(f"[ERROR] Cannot fetch news for {sym}: {e}")
+
+    print(f"[INFO] Unique articles found: {len(raw_articles)}")
+
+    insert_count = 0
+    total_sentiment_sum = 0
+
+    for item in raw_articles:
+        try:
+            headline = clean_text(item.get("headline", ""))
+            if not headline:
                 continue
 
-            data = r.json()
+            url = item.get("url", "")
+            ts = datetime.utcfromtimestamp(item["datetime"])
+            symbol = item.get("related", "").split(",")[0]
+            source = item.get("source", "")
+            fin_id = item.get("id", None)
 
-            for item in data:
-                if "headline" not in item:
-                    continue
+            sentiment = analyze_sentiment_finbert(headline)
+            total_sentiment_sum += sentiment
 
-                article = {
-                    "symbol": sym,
-                    "headline": item["headline"],
-                    "source_name": item.get("source", ""),
-                    "time": datetime.utcfromtimestamp(item["datetime"]),
-                    "url": item.get("url", ""),
-                    "finnhub_id": item.get("id", None),
-                }
-                all_articles.append(article)
-
-        except Exception as e:
-            print(f"[FETCH ERROR] {sym}: {e}")
-
-    print(f"[INFO] Unique articles found: {len(all_articles)}")
-
-    # ----- 3️⃣ Remove duplicates by FINNHUB ID in-memory -----
-    seen = set()
-    filtered = []
-
-    for a in all_articles:
-        fid = a["finnhub_id"]
-        key = fid or a["headline"]  # safe fallback
-        if key not in seen:
-            seen.add(key)
-            filtered.append(a)
-
-    print(f"[INFO] Filtered unique: {len(filtered)}")
-
-    # ----- 4️⃣ Compute sentiment for each article -----
-    print("[INFO] Starting sentiment analysis...")
-
-    for a in filtered:
-        headline = a["headline"]
-        score = finbert_sentiment(headline)
-
-        if score is None:
-            score = vader_sentiment(headline)
-
-        a["sentiment_score"] = score
-
-    # ----- 5️⃣ Insert into DB -----
-    inserted = 0
-
-    try:
-        conn = db()
-        cur = conn.cursor()
-
-        for a in filtered:
             cur.execute("""
                 INSERT INTO news_articles (time, symbol, headline, source_name, sentiment_score, url, finnhub_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING;
-            """, (
-                a["time"],
-                a["symbol"],
-                a["headline"],
-                a["source_name"],
-                a["sentiment_score"],
-                a["url"],
-                a["finnhub_id"]
-            ))
-            inserted += cur.rowcount
+            """, (ts, symbol, headline, source, sentiment, url, fin_id))
 
-        conn.commit()
-        cur.close()
-        conn.close()
+            if cur.rowcount > 0:
+                insert_count += 1
 
-    except Exception as e:
-        print("[DATABASE INSERT ERROR]", e)
-        return
+        except Exception as e:
+            print(f"[INSERT ERROR] {e}")
+            continue
 
-    avg_sentiment = sum(a["sentiment_score"] for a in filtered) / len(filtered)
-    print(f"[SUCCESS] Inserted {inserted} new articles.")
-    print(f"[SENTIMENT] Average sentiment: {avg_sentiment:.4f}")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    avg_sentiment = total_sentiment_sum / max(1, len(raw_articles))
+    print(f"[SUCCESS] Inserted {insert_count} new articles.")
+    print(f"[SENTIMENT] Average sentiment: {avg_sentiment}")
     print("News ingestion complete.")
