@@ -199,33 +199,37 @@ def get_chart_data(
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
     sql = """
-    SELECT headline, source_name, time
-    FROM news_articles
-    WHERE symbol = %s AND sentiment_score > 0.3
-    ORDER BY time DESC
-    LIMIT 10;
+        SELECT headline, source_name, time
+        FROM news_articles
+        WHERE symbol = %s AND sentiment_score > 0.3
+        ORDER BY time DESC
+        LIMIT 10;
     """
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+
+        print(f"[DEBUG] Running positive-news query for symbol={symbol}")
+
         cur.execute(sql, (symbol,))
         rows = cur.fetchall()
 
-        # ✅ NEW FIX: handle empty result early
-        if not rows:
-            cur.close()
-            conn.close()
-            return {"data": []}
+        print(f"[DEBUG] rows returned: {len(rows)}")
 
-        news_list = [
-            {
-                "headline": row[0],
-                "source_name": row[1],
-                "time": row[2]
-            }
-            for row in rows
-        ]
+        # EXTRA safety: row length check
+        news_list = []
+        for row in rows:
+            if len(row) != 3:
+                print(f"[ERROR] Invalid row structure in positive news: {row} (len={len(row)})")
+                continue
+            
+            headline, source_name, time_ts = row
+            news_list.append({
+                "headline": headline,
+                "source_name": source_name,
+                "time": time_ts
+            })
 
         cur.close()
         conn.close()
@@ -233,41 +237,44 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
         return {"data": news_list}
 
     except Exception as e:
-        print("=== DEBUG POSITIVE NEWS SQL ERROR ===")
+        print("=== DEBUG SQL ERROR ===")
         print(e)
-        raise HTTPException(status_code=500, detail="Error fetching positive news")
+        raise HTTPException(status_code=500, detail=f"Error fetching positive news: {e}")
 
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
     sql = """
-    SELECT headline, source_name, time
-    FROM news_articles
-    WHERE symbol = %s AND sentiment_score < -0.3
-    ORDER BY time DESC
-    LIMIT 10;
+        SELECT headline, source_name, time
+        FROM news_articles
+        WHERE symbol = %s AND sentiment_score < -0.3
+        ORDER BY time DESC
+        LIMIT 10;
     """
 
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+
+        print(f"[DEBUG] Running negative-news query for symbol={symbol}")
+
         cur.execute(sql, (symbol,))
         rows = cur.fetchall()
 
-        # ✅ NEW FIX: handle empty results
-        if not rows:
-            cur.close()
-            conn.close()
-            return {"data": []}
+        print(f"[DEBUG] rows returned: {len(rows)}")
 
-        news_list = [
-            {
-                "headline": row[0],
-                "source_name": row[1],
-                "time": row[2]
-            }
-            for row in rows
-        ]
+        news_list = []
+        for row in rows:
+            if len(row) != 3:
+                print(f"[ERROR] Invalid row structure in negative news: {row} (len={len(row)})")
+                continue
+            
+            headline, source_name, time_ts = row
+            news_list.append({
+                "headline": headline,
+                "source_name": source_name,
+                "time": time_ts
+            })
 
         cur.close()
         conn.close()
@@ -275,9 +282,9 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
         return {"data": news_list}
 
     except Exception as e:
-        print("=== DEBUG NEGATIVE NEWS SQL ERROR ===")
+        print("=== DEBUG SQL ERROR ===")
         print(e)
-        raise HTTPException(status_code=500, detail="Error fetching negative news")
+        raise HTTPException(status_code=500, detail=f"Error fetching negative news: {e}")
 
 # SEARCH
 @app.get("/api/v1/search")
