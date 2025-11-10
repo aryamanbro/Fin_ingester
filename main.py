@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import psycopg2.extras
 import finnhub
 import time
 from dotenv import load_dotenv
@@ -7,38 +8,26 @@ from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ---
-# IMPORT YOUR INGESTOR SCRIPTS AS FUNCTIONS
-# ---
 from ingest_prices import fetch_price_data
 from ingest_news import fetch_news_data
 from ingest_trends import fetch_trends_data
 
-# Load all environment variables from .env
 load_dotenv()
 
-# --- Configuration ---
-DATABASE_URL = os.getenv('DATABASE_URL')
-FINNHUB_KEY = os.getenv('FINNHUB_API_KEY')
-TASK_SECRET_KEY = os.getenv('TASK_SECRET_KEY')  # For cron jobs
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')    # For manual admin actions
+DATABASE_URL = os.getenv("DATABASE_URL")
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
+TASK_SECRET_KEY = os.getenv("TASK_SECRET_KEY")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-# --- App Setup ---
 app = FastAPI()
 finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
 
-# --- Pydantic Model ---
 class NewSymbol(BaseModel):
     symbol: str
-    type: str  # e.g., 'stock' or 'crypto'
+    type: str
 
-# --- CORS Middleware ---
-allow_origins = [
-    "http://127.0.0.1:8080",
-    "http://localhost:8080",
-    "*"  # Replace with Vercel URL in production
-]
-
+# CORS config
+allow_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -47,307 +36,202 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Security Helpers ---
+# Security checks
 async def verify_secret(x_task_secret: str = Header(None)):
     if x_task_secret != TASK_SECRET_KEY:
-        print(f"Failed task auth: Invalid key received.")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 async def verify_admin_password(x_admin_password: str = Header(None)):
     if x_admin_password != ADMIN_PASSWORD:
-        print(f"Failed admin auth: Invalid admin password.")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# --- Database Helper ---
-def get_db_connection():
+# DB connection helper
+def get_db():
     try:
-        return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     except Exception as e:
-        print(f"Error connecting to database: {e}")
+        print("DB ERROR:", e)
         raise HTTPException(status_code=500, detail="Database connection error")
 
-# --- Finnhub Helper ---
+# Finnhub helper
 def get_finnhub_symbol(symbol, type):
-    if type == 'crypto':
+    if type == "crypto":
         return f"BINANCE:{symbol.upper()}USDT"
     return symbol.upper()
 
-# ROOT
+# Root
 @app.get("/")
-def read_root():
-    return {"status": f"Sentiment API at {os.getenv('RENDER_EXTERNAL_URL', 'local')} is running"}
+def root():
+    return {"status": "API running"}
 
-# LIVE PRICE
+# Live price
 @app.get("/api/v1/live-price")
-def get_live_price(symbol: str = Query(..., min_length=1)):
-    symbol_type = 'stock'
-    finnhub_symbol = symbol.upper()
-
+def get_live_price(symbol: str):
     try:
-        conn = get_db_connection()
+        conn = get_db()
         cur = conn.cursor()
+
         cur.execute("SELECT type FROM tracked_symbols WHERE symbol = %s", (symbol.upper(),))
-        result = cur.fetchone()
-        if result:
-            symbol_type = result[0]
+        res = cur.fetchone()
+        typ = res["type"] if res else "stock"
         cur.close()
         conn.close()
 
-        finnhub_symbol = get_finnhub_symbol(symbol, symbol_type)
+        finnhub_symbol = get_finnhub_symbol(symbol, typ)
+        print(f"Fetching live price for {symbol} as {finnhub_symbol}")
 
-        print(f"Fetching live price for {symbol} as {finnhub_symbol}...")
         quote = finnhub_client.quote(finnhub_symbol)
 
-        if quote['c'] == 0 and quote['dp'] == 0:
-            raise HTTPException(status_code=404, detail="Symbol not found or no data")
+        if quote["c"] == 0:
+            raise HTTPException(404, "No price found")
 
         return {
             "symbol": symbol,
-            "price": quote['c'],
-            "change": quote['d'],
-            "percent_change": quote['dp']
+            "price": quote["c"],
+            "change": quote["d"],
+            "percent_change": quote["dp"],
         }
 
     except Exception as e:
-        print(f"Error getting live price: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching live data")
+        print("Error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# CHART DATA
+# Chart Data
 @app.get("/api/v1/chart-data")
-def get_chart_data(
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query("1Y", min_length=2)
-):
-    """
-    Fetches all historical data (prices, sentiment, trends)
-    for the main dashboard chart, with a dynamic timeframe.
-    """
-
+def chart(symbol: str, timeframe: str = "1Y"):
     time_interval = {
         "1W": "7 days",
         "1M": "1 month",
         "1Y": "1 year",
-        "ALL": "10 years"
+        "ALL": "10 years",
     }.get(timeframe, "1 year")
 
-    bucket_size = "1 hour" if timeframe in ["1W", "1M"] else "1 day"
+    bucket = "1 hour" if timeframe in ["1W", "1M"] else "1 day"
 
-    sql_query = f"""
+    sql = f"""
     WITH time_series AS (
-        SELECT time_bucket('{bucket_size}', g.time) AS bucket
-        FROM generate_series(
-            NOW() - INTERVAL '{time_interval}',
-            NOW(),
-            INTERVAL '{bucket_size}'
-        ) AS g(time)
-        GROUP BY bucket
-    ),
-    sentiment_data AS (
-        SELECT 
-            time_bucket('{bucket_size}', time) AS bucket,
-            AVG(sentiment_score) AS avg_sentiment
-        FROM news_articles
-        WHERE time > (NOW() - INTERVAL '{time_interval}')
-        GROUP BY bucket
-    ),
-    trends_data AS (
-        SELECT
-            time_bucket('1 day', time) AS bucket,
-            AVG(score) AS google_score
-        FROM google_trends
-        WHERE symbol = %s
-          AND time > (NOW() - INTERVAL '{time_interval}')
+        SELECT time_bucket('{bucket}', g.time) AS bucket
+        FROM generate_series(NOW() - INTERVAL '{time_interval}', NOW(), INTERVAL '{bucket}') AS g(time)
         GROUP BY bucket
     ),
     price_data AS (
-        SELECT
-            time_bucket('{bucket_size}', time) AS bucket,
-            LAST(price, time) AS close
+        SELECT time_bucket('{bucket}', time) AS bucket, LAST(price, time) AS close
         FROM prices
         WHERE symbol = %s
-          AND time > (NOW() - INTERVAL '{time_interval}')
+          AND time > NOW() - INTERVAL '{time_interval}'
+        GROUP BY bucket
+    ),
+    sentiment_data AS (
+        SELECT time_bucket('{bucket}', time) AS bucket, AVG(sentiment_score) AS sentiment
+        FROM news_articles
+        WHERE time > NOW() - INTERVAL '{time_interval}'
+        GROUP BY bucket
+    ),
+    trends_data AS (
+        SELECT time_bucket('1 day', time) AS bucket, AVG(score) AS google_score
+        FROM google_trends
+        WHERE symbol = %s
+          AND time > NOW() - INTERVAL '{time_interval}'
         GROUP BY bucket
     )
     SELECT
         t.bucket AS time,
         p.close AS price,
         g.google_score AS google_trends_score,
-        s.avg_sentiment AS sentiment
-    FROM time_series AS t
-    LEFT JOIN price_data AS p ON t.bucket = p.bucket
-    LEFT JOIN trends_data AS g ON time_bucket('1 day', t.bucket) = g.bucket
-    LEFT JOIN sentiment_data AS s ON t.bucket = s.bucket
-    ORDER BY t.bucket ASC;
+        s.sentiment AS sentiment
+    FROM time_series t
+    LEFT JOIN price_data p ON p.bucket = t.bucket
+    LEFT JOIN sentiment_data s ON s.bucket = t.bucket
+    LEFT JOIN trends_data g ON g.bucket = time_bucket('1 day', t.bucket)
+    ORDER BY t.bucket;
     """
 
     try:
-        conn = get_db_connection()
+        conn = get_db()
         cur = conn.cursor()
-        cur.execute(sql_query, (symbol, symbol))
-        rows = cur.fetchall()
-        colnames = [desc[0] for desc in cur.description]
-        data = [dict(zip(colnames, row)) for row in rows]
+        cur.execute(sql, (symbol, symbol))
+        data = cur.fetchall()
         cur.close()
         conn.close()
         return {"data": data}
-
     except Exception as e:
-        print(f"Error fetching chart data: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching chart data")
+        print("Chart error:", e)
+        raise HTTPException(500, str(e))
 
-# POSITIVE NEWS
+# Positive news
 @app.get("/api/v1/positive-news")
-def get_positive_news(symbol: str = Query(..., min_length=1)):
-    sql = """
-        SELECT headline, source_name, time
-        FROM news_articles
-        WHERE symbol = %s AND sentiment_score > 0.3
-        ORDER BY time DESC
-        LIMIT 10;
-    """
-
+def positive(symbol: str):
     try:
-        conn = get_db_connection()
+        conn = get_db()
         cur = conn.cursor()
-
-        print(f"[DEBUG] Running positive-news query for symbol={symbol}")
-
-        cur.execute(sql, (symbol,))
+        cur.execute("""
+            SELECT headline, source_name, time
+            FROM news_articles
+            WHERE symbol = %s AND sentiment_score > 0.1
+            ORDER BY time DESC LIMIT 10;
+        """, (symbol,))
         rows = cur.fetchall()
-
-        print(f"[DEBUG] rows returned: {len(rows)}")
-
-        # EXTRA safety: row length check
-        news_list = []
-        for row in rows:
-            if len(row) != 3:
-                print(f"[ERROR] Invalid row structure in positive news: {row} (len={len(row)})")
-                continue
-            
-            headline, source_name, time_ts = row
-            news_list.append({
-                "headline": headline,
-                "source_name": source_name,
-                "time": time_ts
-            })
-
         cur.close()
         conn.close()
-
-        return {"data": news_list}
-
+        return {"data": rows}
     except Exception as e:
-        print("=== DEBUG SQL ERROR ===")
         print(e)
-        raise HTTPException(status_code=500, detail=f"Error fetching positive news: {e}")
+        raise HTTPException(500, str(e))
 
-# NEGATIVE NEWS
+# Negative news
 @app.get("/api/v1/negative-news")
-def get_negative_news(symbol: str = Query(..., min_length=1)):
-    sql = """
-        SELECT headline, source_name, time
-        FROM news_articles
-        WHERE symbol = %s AND sentiment_score < -0.3
-        ORDER BY time DESC
-        LIMIT 10;
-    """
-
+def negative(symbol: str):
     try:
-        conn = get_db_connection()
+        conn = get_db()
         cur = conn.cursor()
-
-        print(f"[DEBUG] Running negative-news query for symbol={symbol}")
-
-        cur.execute(sql, (symbol,))
+        cur.execute("""
+            SELECT headline, source_name, time
+            FROM news_articles
+            WHERE symbol = %s AND sentiment_score < -0.1
+            ORDER BY time DESC LIMIT 10;
+        """, (symbol,))
         rows = cur.fetchall()
-
-        print(f"[DEBUG] rows returned: {len(rows)}")
-
-        news_list = []
-        for row in rows:
-            if len(row) != 3:
-                print(f"[ERROR] Invalid row structure in negative news: {row} (len={len(row)})")
-                continue
-            
-            headline, source_name, time_ts = row
-            news_list.append({
-                "headline": headline,
-                "source_name": source_name,
-                "time": time_ts
-            })
-
         cur.close()
         conn.close()
-
-        return {"data": news_list}
-
+        return {"data": rows}
     except Exception as e:
-        print("=== DEBUG SQL ERROR ===")
         print(e)
-        raise HTTPException(status_code=500, detail=f"Error fetching negative news: {e}")
+        raise HTTPException(500, str(e))
 
-# SEARCH
-@app.get("/api/v1/search")
-def search_symbols(query: str = Query(..., min_length=1)):
-    sql = "SELECT symbol, type FROM tracked_symbols WHERE symbol ILIKE %s LIMIT 10;"
-    search_query = f"%{query}%"
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(sql, (search_query,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return {
-        "data": [
-            {"symbol": r[0], "name": f"{r[0]} ({r[1].capitalize()})", "exchange": "Tracked"}
-            for r in rows
-        ]
-    }
-
-# ✅ FIXED INGESTION ENDPOINTS — synchronous execution
+# Ingestion endpoints
 @app.post("/api/v1/tasks/run-prices", dependencies=[Depends(verify_secret)])
-async def trigger_price_ingest():
-    print("Task received: run-prices STARTING NOW")
+def run_prices():
     fetch_price_data()
-    print("Task received: run-prices FINISHED")
-    return {"message": "Price ingest completed."}
+    return {"status": "prices_ingested"}
 
 @app.post("/api/v1/tasks/run-news", dependencies=[Depends(verify_secret)])
-async def trigger_news_ingest():
-    print("Task received: run-news STARTING NOW")
+def run_news():
     fetch_news_data()
-    print("Task received: run-news FINISHED")
-    return {"message": "News ingest completed."}
+    return {"status": "news_ingested"}
 
 @app.post("/api/v1/tasks/run-trends", dependencies=[Depends(verify_secret)])
-async def trigger_trends_ingest():
-    print("Task received: run-trends STARTING NOW")
+def run_trends():
     fetch_trends_data()
-    print("Task received: run-trends FINISHED")
-    return {"message": "Trends ingest completed."}
+    return {"status": "trends_ingested"}
 
-# ADD SYMBOL
+# Add symbol
 @app.post("/api/v1/add-symbol", dependencies=[Depends(verify_admin_password)])
-async def add_new_symbol(new_symbol: NewSymbol):
+def add_symbol(new: NewSymbol):
     try:
-        conn = get_db_connection()
+        conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO tracked_symbols (symbol, type) VALUES (%s, %s) ON CONFLICT(symbol) DO NOTHING",
-            (new_symbol.symbol, new_symbol.type)
+            "INSERT INTO tracked_symbols(symbol, type) VALUES(%s, %s) ON CONFLICT(symbol) DO NOTHING;",
+            (new.symbol, new.type),
         )
-        added = cur.rowcount
         conn.commit()
         cur.close()
         conn.close()
-
-        print(f"New symbol {new_symbol.symbol} added. Running backfill...")
 
         fetch_price_data()
         fetch_news_data()
         fetch_trends_data()
 
-        return {"message": f"Symbol {new_symbol.symbol} added and backfilled."}
-
+        return {"status": f"{new.symbol} added"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding symbol: {e}")
+        raise HTTPException(500, str(e))
