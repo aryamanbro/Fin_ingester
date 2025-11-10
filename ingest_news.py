@@ -21,25 +21,45 @@ HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 # ------------------------------------
 def get_finbert_sentiment(headline: str) -> float:
     try:
-        json_payload = {"inputs": headline}
-        response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
+        url = "https://router.huggingface.co/v1/models/ProsusAI/finbert"
+        
+        payload = {
+            "inputs": headline
+        }
 
-        if response.status_code == 503:
-            time.sleep(10)
-            response = requests.post(FINBERT_API_URL, headers=HF_HEADERS, json=json_payload)
+        response = requests.post(url, json=payload, headers={
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json"
+        })
+
+        if response.status_code == 529:  # model loading
+            print("[FinBERT] Model loading. Retrying...")
+            time.sleep(8)
+            response = requests.post(url, json=payload, headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type": "application/json"
+            })
 
         if response.status_code != 200:
             print(f"[FinBERT ERROR] {response.status_code}: {response.text}")
             return 0
 
-        scores = response.json()[0]
-        sentiment = {s['label']: s['score'] for s in scores}
-        compound_score = sentiment.get('positive', 0) - sentiment.get('negative', 0)
-        return compound_score
+        # Response format:
+        # [{"label": "positive", "score": X}, ...]
+        data = response.json()
+
+        if isinstance(data, dict) and "error" in data:
+            print("[FinBERT ERROR]", data["error"])
+            return 0
+
+        scores = data[0]
+        sentiment_map = {s["label"]: s["score"] for s in scores}
+        return sentiment_map.get("positive", 0) - sentiment_map.get("negative", 0)
 
     except Exception as e:
         print(f"[FinBERT EXCEPTION] {e}")
         return 0
+
 
 # ------------------------------------
 # Discord Alert Helper
