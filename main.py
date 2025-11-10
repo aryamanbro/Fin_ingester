@@ -204,8 +204,8 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
     FROM news_articles
     WHERE sentiment_score > 0.3
       AND (
-          LOWER(headline) LIKE '%' || LOWER(%s) || '%'
-          OR LOWER(source_name) LIKE '%' || LOWER(%s) || '%'
+          COALESCE(LOWER(headline), '') LIKE '%' || LOWER(%s) || '%'
+          OR COALESCE(LOWER(source_name), '') LIKE '%' || LOWER(%s) || '%'
       )
     ORDER BY time DESC
     LIMIT 10;
@@ -218,7 +218,6 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
         rows = cur.fetchall()
 
         colnames = [desc[0] for desc in cur.description]
-
         news_list = [dict(zip(colnames, row)) for row in rows]
 
         cur.close()
@@ -226,8 +225,10 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
         return {"data": news_list}
 
     except Exception as e:
-        print(f"Error fetching positive news: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching news")
+        print("=== DEBUG SQL ERROR ===")
+        print(str(e))
+        raise HTTPException(status_code=500, detail="Error fetching news")
+
 
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
