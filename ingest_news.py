@@ -19,46 +19,43 @@ HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 # ------------------------------------
 # HuggingFace FinBERT sentiment helper
 # ------------------------------------
-def get_finbert_sentiment(headline: str) -> float:
+def get_finbert_sentiment(text: str) -> float:
     try:
-        url = "https://router.huggingface.co/v1/models/ProsusAI/finbert"
-        
+        url = "https://router.huggingface.co/hf-inference/text-classification"
+
         payload = {
-            "inputs": headline
+            "model": "ProsusAI/finbert",
+            "inputs": text
         }
 
-        response = requests.post(url, json=payload, headers={
+        headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
             "Content-Type": "application/json"
-        })
+        }
 
-        if response.status_code == 529:  # model loading
-            print("[FinBERT] Model loading. Retrying...")
-            time.sleep(8)
-            response = requests.post(url, json=payload, headers={
-                "Authorization": f"Bearer {HF_TOKEN}",
-                "Content-Type": "application/json"
-            })
+        response = requests.post(url, json=payload, headers=headers)
+
+        if response.status_code == 529:
+            print("[FinBERT] Model cold-start, retrying...")
+            time.sleep(5)
+            response = requests.post(url, json=payload, headers=headers)
 
         if response.status_code != 200:
             print(f"[FinBERT ERROR] {response.status_code}: {response.text}")
-            return 0
+            return 0.0
 
-        # Response format:
-        # [{"label": "positive", "score": X}, ...]
-        data = response.json()
+        result = response.json()
 
-        if isinstance(data, dict) and "error" in data:
-            print("[FinBERT ERROR]", data["error"])
-            return 0
+        # result is List[List[{"label": "...", "score": 0.XX}, ...]]
+        scores = result[0]
+        score_map = {item["label"].lower(): item["score"] for item in scores}
 
-        scores = data[0]
-        sentiment_map = {s["label"]: s["score"] for s in scores}
-        return sentiment_map.get("positive", 0) - sentiment_map.get("negative", 0)
+        return score_map.get("positive", 0) - score_map.get("negative", 0)
 
     except Exception as e:
-        print(f"[FinBERT EXCEPTION] {e}")
+        print("[FinBERT EXCEPTION]", e)
         return 0
+
 
 
 # ------------------------------------
