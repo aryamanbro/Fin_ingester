@@ -36,3 +36,6 @@ tzdata==2025.2
 urllib3==1.26.18
 uvicorn==0.38.0
 yarl==1.22.0
+
+# ✅ ADDED DEPENDENCIES BELOW
+yfinance==0.2.37
