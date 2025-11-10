@@ -2,23 +2,26 @@ import os
 import psycopg2
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-FMP_API_KEY = os.getenv("FMP_API_KEY")   # Stock data
-CG_BASE = "https://api.coingecko.com/api/v3"   # Crypto data
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+CG_API_KEY = os.getenv("CG_API_KEY")  # <-- NEW
+CG_BASE = "https://api.coingecko.com/api/v3"
+
 
 # -------------------------------------------
-# Helper: Database connection
+# DB connection helper
 # -------------------------------------------
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
+
 # -------------------------------------------
-# Helper: Insert candle row
+# Insert row helper
 # -------------------------------------------
 def insert_row(cur, symbol, ts, price, volume):
     sql = """
@@ -28,101 +31,178 @@ def insert_row(cur, symbol, ts, price, volume):
     """
     cur.execute(sql, (ts, symbol, float(price), float(volume)))
 
+
 # -------------------------------------------
-# Fetch stock data from FMP
+# Fetch from FMP
 # -------------------------------------------
 def fetch_stock(symbol):
-    print(f"[FMP] Fetching daily candles for stock {symbol}...")
+    print(f"[FMP] Fetching data for stock {symbol}...")
 
-    url = f"https://financialmodelingprep.com/api/v3/historical-chart/1hour/{symbol}?apikey={FMP_API_KEY}"
+    hourly_url = f"https://financialmodelingprep.com/api/v3/historical-chart/1hour/{symbol}?apikey={FMP_API_KEY}"
     daily_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?apikey={FMP_API_KEY}"
 
-    results = {"hourly": [], "daily": []}
+    result = {"hourly": [], "daily": []}
 
-    try:
-        r1 = requests.get(url, timeout=10)
-        if r1.status_code == 200:
-            results["hourly"] = r1.json()
-        else:
-            print(f"[FMP ERROR] Hourly data {symbol}: {r1.text}")
-    except Exception as e:
-        print(f"[FMP ERROR] Hourly fetch failed for {symbol}: {e}")
-
-    try:
-        r2 = requests.get(daily_url, timeout=10)
-        if r2.status_code == 200:
-            json_data = r2.json()
-            if "historical" in json_data:
-                results["daily"] = json_data["historical"]
-        else:
-            print(f"[FMP ERROR] Daily data {symbol}: {r2.text}")
-    except Exception as e:
-        print(f"[FMP ERROR] Daily fetch failed for {symbol}: {e}")
-
-    return results
-
-# -------------------------------------------
-# Fetch crypto data from CoinGecko
-# -------------------------------------------
-def fetch_crypto(symbol):
-    print(f"[CG] Fetching candles for crypto {symbol}...")
-
-    # coingecko uses lowercase ids: bitcoin, ethereum
-    id_map = {
-        "BTC": "bitcoin",
-        "ETH": "ethereum"
-    }
-
-    if symbol not in id_map:
-        print(f"[CG ERROR] No mapping for {symbol}")
-        return {"hourly": [], "daily": []}
-
-    crypto_id = id_map[symbol]
-
-    # Hourly last 30 days
-    hourly_url = f"{CG_BASE}/coins/{crypto_id}/market_chart?vs_currency=usd&days=30&interval=hourly"
-
-    # Daily 365 days
-    daily_url = f"{CG_BASE}/coins/{crypto_id}/market_chart?vs_currency=usd&days=365"
-
-    results = {"hourly": [], "daily": []}
-
+    # Hourly
     try:
         r1 = requests.get(hourly_url, timeout=10)
         if r1.status_code == 200:
-            results["hourly"] = r1.json().get("prices", [])
+            result["hourly"] = r1.json()
         else:
-            print(f"[CG ERROR] Hourly {symbol}: {r1.text}")
+            print(f"[FMP ERROR HOURLY {symbol}] {r1.text}")
     except Exception as e:
-        print(f"[CG ERROR] Hourly fetch failed for {symbol}: {e}")
+        print(f"[FMP EXCEPTION HOURLY {symbol}] {e}")
 
+    # Daily
     try:
         r2 = requests.get(daily_url, timeout=10)
         if r2.status_code == 200:
-            results["daily"] = r2.json().get("prices", [])
+            js = r2.json()
+            if "historical" in js:
+                result["daily"] = js["historical"]
         else:
-            print(f"[CG ERROR] Daily {symbol}: {r2.text}")
+            print(f"[FMP ERROR DAILY {symbol}] {r2.text}")
     except Exception as e:
-        print(f"[CG ERROR] Daily fetch failed for {symbol}: {e}")
+        print(f"[FMP EXCEPTION DAILY {symbol}] {e}")
 
-    return results
+    return result
+
+
+# -------------------------------------------
+# Fetch from CoinGecko (with API key)
+# -------------------------------------------
+def fetch_crypto(symbol):
+    print(f"[CG] Fetching data for crypto {symbol}...")
+
+    id_map = {"BTC": "bitcoin", "ETH": "ethereum"}
+
+    if symbol not in id_map:
+        print(f"[CG ERROR] Mapping not found for {symbol}")
+        return {"hourly": [], "daily": []}
+
+    cid = id_map[symbol]
+
+    headers = {
+        "x-cg-demo-api-key": CG_API_KEY
+    }
+
+    # Hourly 30 days
+    hourly_url = f"{CG_BASE}/coins/{cid}/market_chart?vs_currency=usd&days=30&interval=hourly"
+
+    # Daily 365 days
+    daily_url = f"{CG_BASE}/coins/{cid}/market_chart?vs_currency=usd&days=365"
+
+    result = {"hourly": [], "daily": []}
+
+    # Hourly
+    try:
+        r1 = requests.get(hourly_url, headers=headers, timeout=10)
+        if r1.status_code == 200:
+            result["hourly"] = r1.json().get("prices", [])
+        else:
+            print(f"[CG HOURLY ERROR {symbol}] {r1.status_code} {r1.text}")
+    except Exception as e:
+        print(f"[CG HOURLY EXCEPTION {symbol}] {e}")
+
+    # Daily
+    try:
+        r2 = requests.get(daily_url, headers=headers, timeout=10)
+        if r2.status_code == 200:
+            result["daily"] = r2.json().get("prices", [])
+        else:
+            print(f"[CG DAILY ERROR {symbol}] {r2.status_code} {r2.text}")
+    except Exception as e:
+        print(f"[CG DAILY EXCEPTION {symbol}] {e}")
+
+    return result
+
 
 # -------------------------------------------
 # Main ingestion driver
 # -------------------------------------------
 def fetch_price_data():
-    print("DEBUG: I am inside fetch_price_data() NOW!")  # <-- Confirm entry
+    print("=== DEBUG: ENTERED fetch_price_data() ===")
 
     try:
-        print("DEBUG: Starting DB connection...")
-        conn = psycopg2.connect(DATABASE_URL)
-        print("DEBUG: Database connected!")
+        print("DEBUG: Connecting to DB...")
+        conn = get_db()
+        cur = conn.cursor()
+        print("DEBUG: DB connection OK")
 
-        # continue existing code...
+        # Fetch tracked symbols
+        cur.execute("SELECT symbol, type FROM tracked_symbols")
+        symbols = cur.fetchall()
+        print(f"[INFO] Tracking {len(symbols)} symbols...")
+
+        for sym, typ in symbols:
+            print(f"\n=== PROCESSING {sym} ({typ}) ===")
+
+            inserted = 0
+
+            if typ == "stock":
+                data = fetch_stock(sym)
+
+                # HOURLY
+                for candle in data["hourly"]:
+                    try:
+                        ts = datetime.fromisoformat(candle["date"])
+                        price = candle["close"]
+                        volume = candle["volume"]
+                        insert_row(cur, sym, ts, price, volume)
+                        inserted += cur.rowcount
+                    except Exception as e:
+                        print(f"[FMP INSERT ERROR HOURLY {sym}] {e}")
+
+                # DAILY
+                for candle in data["daily"]:
+                    try:
+                        ts = datetime.fromisoformat(candle["date"])
+                        price = candle["close"]
+                        volume = candle["volume"]
+                        insert_row(cur, sym, ts, price, volume)
+                        inserted += cur.rowcount
+                    except Exception as e:
+                        print(f"[FMP INSERT ERROR DAILY {sym}] {e}")
+
+            elif typ == "crypto":
+                data = fetch_crypto(sym)
+
+                # HOURLY → timestamp in ms
+                for p in data["hourly"]:
+                    try:
+                        ts = datetime.utcfromtimestamp(p[0] / 1000)
+                        price = p[1]
+                        volume = 0
+                        insert_row(cur, sym, ts, price, volume)
+                        inserted += cur.rowcount
+                    except Exception as e:
+                        print(f"[CG INSERT ERROR HOURLY {sym}] {e}")
+
+                # DAILY → timestamp in ms
+                for p in data["daily"]:
+                    try:
+                        ts = datetime.utcfromtimestamp(p[0] / 1000)
+                        price = p[1]
+                        volume = 0
+                        insert_row(cur, sym, ts, price, volume)
+                        inserted += cur.rowcount
+                    except Exception as e:
+                        print(f"[CG INSERT ERROR DAILY {sym}] {e}")
+
+            conn.commit()
+            print(f"[OK] Inserted {inserted} points for {sym}")
+
+        print("=== PRICE INGEST COMPLETE === ✅")
 
     except Exception as e:
-        print("DEBUG ERROR: ", e)
-        raise
+        print("🔥 FATAL ERROR in price ingest:", e)
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":
