@@ -198,15 +198,10 @@ def get_chart_data(
 # POSITIVE NEWS
 @app.get("/api/v1/positive-news")
 def get_positive_news(symbol: str = Query(..., min_length=1)):
-
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
-    WHERE sentiment_score > 0.3
-      AND (
-          COALESCE(LOWER(headline), '') LIKE '%' || LOWER(%s) || '%'
-          OR COALESCE(LOWER(source_name), '') LIKE '%' || LOWER(%s) || '%'
-      )
+    WHERE symbol = %s AND sentiment_score > 0.3
     ORDER BY time DESC
     LIMIT 10;
     """
@@ -214,34 +209,41 @@ def get_positive_news(symbol: str = Query(..., min_length=1)):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(sql, (symbol, symbol))
+        cur.execute(sql, (symbol,))
         rows = cur.fetchall()
 
-        colnames = [desc[0] for desc in cur.description]
-        news_list = [dict(zip(colnames, row)) for row in rows]
+        # ✅ NEW FIX: handle empty result early
+        if not rows:
+            cur.close()
+            conn.close()
+            return {"data": []}
+
+        news_list = [
+            {
+                "headline": row[0],
+                "source_name": row[1],
+                "time": row[2]
+            }
+            for row in rows
+        ]
 
         cur.close()
         conn.close()
+
         return {"data": news_list}
 
     except Exception as e:
-        print("=== DEBUG SQL ERROR ===")
-        print(str(e))
-        raise HTTPException(status_code=500, detail="Error fetching news")
-
+        print("=== DEBUG POSITIVE NEWS SQL ERROR ===")
+        print(e)
+        raise HTTPException(status_code=500, detail="Error fetching positive news")
 
 # NEGATIVE NEWS
 @app.get("/api/v1/negative-news")
 def get_negative_news(symbol: str = Query(..., min_length=1)):
-
     sql = """
     SELECT headline, source_name, time
     FROM news_articles
-    WHERE sentiment_score < -0.3
-      AND (
-          LOWER(headline) LIKE '%' || LOWER(%s) || '%'
-          OR LOWER(source_name) LIKE '%' || LOWER(%s) || '%'
-      )
+    WHERE symbol = %s AND sentiment_score < -0.3
     ORDER BY time DESC
     LIMIT 10;
     """
@@ -249,20 +251,33 @@ def get_negative_news(symbol: str = Query(..., min_length=1)):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(sql, (symbol, symbol))
+        cur.execute(sql, (symbol,))
         rows = cur.fetchall()
 
-        colnames = [desc[0] for desc in cur.description]
+        # ✅ NEW FIX: handle empty results
+        if not rows:
+            cur.close()
+            conn.close()
+            return {"data": []}
 
-        news_list = [dict(zip(colnames, row)) for row in rows]
+        news_list = [
+            {
+                "headline": row[0],
+                "source_name": row[1],
+                "time": row[2]
+            }
+            for row in rows
+        ]
 
         cur.close()
         conn.close()
+
         return {"data": news_list}
 
     except Exception as e:
-        print(f"Error fetching negative news: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching news")
+        print("=== DEBUG NEGATIVE NEWS SQL ERROR ===")
+        print(e)
+        raise HTTPException(status_code=500, detail="Error fetching negative news")
 
 # SEARCH
 @app.get("/api/v1/search")
