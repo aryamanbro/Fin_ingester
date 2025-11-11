@@ -275,3 +275,9 @@ def search_symbols(query: str = Query(..., min_length=1)):
     except Exception as e:
         print("Search error:", e)
         raise HTTPException(status_code=500, detail="Error searching tracked symbols")
+
+
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
